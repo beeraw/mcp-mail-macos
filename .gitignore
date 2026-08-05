@@ -1,0 +1,24 @@
+# Virtualenv and bytecode
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# The search index is rebuilt from Mail's store:
+#   python3 mail_index.py --build
+index.sqlite
+index.sqlite-wal
+index.sqlite-shm
+index.sqlite.sync.lock
+
+# Drafts, their archive and the sent ledger hold real message content
+mails/
+
+# Background sync agent output
+launchd/sync.log
+
+# Local settings: copy config.example.json to config.json
+config.json
+
+# macOS
+.DS_Store
