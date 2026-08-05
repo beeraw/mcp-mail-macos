@@ -12,10 +12,16 @@ mails in any usable time.
 Tested on macOS 27, Python 3.14, Mail 16, against Gmail, IMAP and Exchange
 accounts, on a mailbox of roughly 50,000 messages spanning several years.
 
+> **Read this before installing.** This server grants an agent the right to
+> read, send, move and delete mail on *every* account Mail is configured with,
+> and the search index needs Full Disk Access, which macOS cannot scope to a
+> single folder. See [Before you trust it with your mail](#before-you-trust-it-with-your-mail).
+
 ---
 
 ## Contents
 
+- [Before you trust it with your mail](#before-you-trust-it-with-your-mail)
 - [Requirements](#requirements)
 - [Install](#install)
 - [macOS permissions](#macos-permissions)
@@ -30,6 +36,45 @@ accounts, on a mailbox of roughly 50,000 messages spanning several years.
 - [Testing](#testing)
 - [Project layout](#project-layout)
 - [License](#license)
+
+---
+
+## Before you trust it with your mail
+
+This is a local tool for one person on their own machine. It is not a service,
+and it was not designed to be exposed to several users. What it asks for is
+broad, and worth weighing before installing.
+
+**Automation lets an agent act on every account.** One grant, once, and the
+server can read, send, reply, move and delete across all of them. There is no
+per-account allowlist — adding one means filtering in two places (see
+[Scope](#scope)).
+
+**Full Disk Access is all or nothing.** The index reads `~/Library/Mail`, which
+macOS protects; there is no setting scoped to that folder. Granting it also
+grants Messages, browser history and other applications' data to whatever
+application you granted it to, and for every future session until you revoke it.
+
+**Message content reaches the agent unfiltered.** Anyone can send you mail, and
+that mail lands in an agent's context as text. That is the classic prompt
+injection setup, and no permission dialog stands between the two.
+
+Reasonable precautions, in rough order of value:
+
+1. **Try it on a secondary account first**, before pointing it at anything that
+   matters.
+2. **Keep the confirmation guard.** Every send requires `confirm=true` and
+   returns a preview otherwise. It makes each send deliberate and shows exactly
+   what would leave.
+3. **Only grant Full Disk Access if you need indexed search**, and revoke it
+   afterwards — everything already indexed stays searchable. Set
+   `index_max_age_minutes` high in `config.json` so the server stops trying to
+   refresh.
+4. **Decide whether an agent should send at all.** Preparing drafts as `.eml`
+   files and sending them yourself is a perfectly good mode; `write_draft`
+   touches nothing but a folder.
+5. **Run the checks before real use**: `python3 -m unittest discover -s tests -t .`
+   for the logic, then `test_manual.py read` against your own Mail.
 
 ---
 
