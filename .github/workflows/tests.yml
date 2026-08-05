@@ -1,0 +1,35 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    # macOS only: the server drives Mail through AppleScript. The unit tests
+    # themselves never call osascript, but keeping the runner on macOS means a
+    # future test that does will not silently be skipped.
+    runs-on: macos-latest
+
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -t . -v
+
+      - name: Check every module imports
+        # The MCP SDK is not installed here on purpose: the modules that talk to
+        # Mail and to the index must not depend on it.
+        run: python -c "import mail_tools, mail_files, mail_search, mail_index"

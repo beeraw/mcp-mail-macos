@@ -1,0 +1,16 @@
+{
+  "_comment": "Copy to config.json and keep only the keys you want to change. Every key is optional; anything absent uses the built-in default. An environment variable MAIL_MCP_<KEY> overrides both.",
+
+  "drafts_folder": "~/Documents/Outgoing mail",
+  "pending_retention_days": 7,
+  "archive_retention_days": 30,
+  "ledger_window_hours": 2,
+
+  "index_path": "~/Library/Application Support/mcp-mail-macos/index.sqlite",
+  "mail_root": "~/Library/Mail",
+  "index_max_age_minutes": 10,
+
+  "applescript_timeout": 120,
+  "applescript_write_timeout": 180,
+  "body_limit": 200000
+}

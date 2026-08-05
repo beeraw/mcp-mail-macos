@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Keeps the search index up to date without a Claude session being open.
+
+  Replace /ABSOLUTE/PATH/TO with where this repository lives, then:
+    cp launchd/com.mcp-mail-macos.sync.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.mcp-mail-macos.sync.plist
+
+  Uninstall:
+    launchctl unload ~/Library/LaunchAgents/com.mcp-mail-macos.sync.plist
+    rm ~/Library/LaunchAgents/com.mcp-mail-macos.sync.plist
+
+  The agent reads ~/Library/Mail, so Full Disk Access has to be granted to the
+  program below — /usr/bin/python3 — and not to Claude. Be aware that this hands
+  that access to every Python script run on this machine, which is wider than an
+  app-scoped grant. Whether that trade is worth it is a judgement call: the MCP
+  server refreshes the index on its own whenever Claude itself holds the access.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.mcp-mail-macos.sync</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/ABSOLUTE/PATH/TO/mcp-mail-macos/mail_index.py</string>
+        <string>--sync</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/ABSOLUTE/PATH/TO/mcp-mail-macos</string>
+
+    <!-- Ten minutes. A pass with nothing to do costs about two seconds. -->
+    <key>StartInterval</key>
+    <integer>600</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/ABSOLUTE/PATH/TO/mcp-mail-macos/launchd/sync.log</string>
+    <key>StandardErrorPath</key>
+    <string>/ABSOLUTE/PATH/TO/mcp-mail-macos/launchd/sync.log</string>
+
+    <!-- Never let the sync compete with foreground work. -->
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>LowPriorityIO</key>
+    <true/>
+    <key>Nice</key>
+    <integer>10</integer>
+</dict>
+</plist>
