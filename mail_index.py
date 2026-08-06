@@ -168,9 +168,12 @@ def extract_attachments(identifier: int, destination: str | None = None) -> tupl
     message instead. Needs Full Disk Access.
 
     A signature logo is a part with a file name like any other, but it belongs
-    to the body and Mail counts it among the attachments. Re-sending it as one
-    would show the recipient a stray image, so parts carrying a Content-ID or
-    marked inline are skipped.
+    to the body and Mail counts it among the attachments; re-sending it as one
+    would show the recipient a stray image. Telling the two apart is not
+    obvious: AppleScript inserts a real attachment *into* the body, so it also
+    ends up inline, with a Content-ID, referenced from the HTML. What separates
+    them is how the HTML refers to it — an <img src="cid:…"> is part of the body,
+    while an <object data="cid:…"> is an attachment Mail is merely showing.
     """
     path = find_message_file(identifier)
     if path is None:
@@ -180,6 +183,22 @@ def extract_attachments(identifier: int, destination: str | None = None) -> tupl
         raise ValueError(f"Unreadable message file: {path}")
 
     message = email.message_from_bytes(raw, policy=email.policy.default)
+
+    # Content-IDs the HTML body displays as images. Those, and only those,
+    # belong to the body rather than to the list of attachments.
+    body_images: set[str] = set()
+    for part in message.walk():
+        if part.get_content_type() != "text/html":
+            continue
+        try:
+            html_text = (part.get_payload(decode=True) or b"").decode(
+                part.get_content_charset() or "utf-8", errors="replace"
+            )
+        except LookupError:
+            continue
+        for cid in re.findall(r"<img[^>]+src=[\"']?cid:([^\"'>\s]+)", html_text, re.IGNORECASE):
+            body_images.add(cid.strip())
+
     written: list[str] = []
     skipped: list[str] = []
     for index, part in enumerate(message.walk()):
@@ -189,7 +208,8 @@ def extract_attachments(identifier: int, destination: str | None = None) -> tupl
         disposition = part.get_content_disposition()
         if not filename and disposition != "attachment":
             continue
-        if disposition != "attachment" and (part.get("content-id") or disposition == "inline"):
+        content_id = (part.get("content-id") or "").strip().strip("<>")
+        if disposition != "attachment" and content_id and content_id in body_images:
             skipped.append(filename or f"piece-{index}")
             continue
         payload = part.get_payload(decode=True)
