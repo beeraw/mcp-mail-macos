@@ -542,8 +542,14 @@ it actually scanned, and general search goes through the index.
   sent, and cannot be closed through AppleScript. They are invisible, and cleared
   by restarting Mail. This matters because identifying a compose window by
   position rather than by id will eventually pick the wrong one — and send it.
-- **Mail counts a signature image among the attachments.** It is not re-sent as
-  one; the answer reports it under `kept_inline`.
+- **Mail counts a signature image among the attachments**, and telling it apart
+  from a real one is not obvious. AppleScript can only add an attachment *into*
+  the body, so a file ends up inline, with a Content-ID, referenced from the
+  HTML — exactly like a signature logo. Skipping every inline part therefore
+  drops real attachments without a word. The discriminator is how the HTML
+  refers to it: `<img src="cid:…">` belongs to the body, while
+  `<object data="cid:…">` is a file Mail is merely displaying. What was left
+  behind is reported under `kept_inline`.
 - **Gmail labels are mailboxes**, and one message appears in several. `INBOX` can
   resolve to All Mail: a message's `mailbox` field reports where Mail sees it,
   which is not always what was queried.

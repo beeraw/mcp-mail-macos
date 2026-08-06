@@ -412,27 +412,64 @@ class StoredMessageTests(unittest.TestCase):
                 handle.write("not a byte count\n")
             self.assertIsNone(mail_index.read_raw_message(path))
 
-    def test_inline_signature_is_not_treated_as_an_attachment(self):
+    def _with_parts(self, html_body):
+        """A message shaped the way Mail stores one: everything inline, with cids."""
         message = email.message.EmailMessage()
-        message["Subject"] = "With signature"
+        message["Subject"] = "Stored"
         message.set_content("body")
+        message.add_alternative(html_body, subtype="html")
+        return message
+
+    def test_body_image_is_skipped_but_an_inline_attachment_is_kept(self):
+        """The regression behind a silent attachment loss.
+
+        AppleScript inserts an attachment into the body, so Mail stores it
+        inline with a Content-ID — exactly like a signature logo. Skipping every
+        inline part therefore dropped real attachments without a word. What
+        separates them is the HTML: <img> for the body, <object> for a file.
+        """
+        html_body = (
+            '<html><body>text'
+            '<img alt="logo.png" src="cid:LOGO-CID">'
+            '<object type="application/x-apple-msg-attachment" data="cid:FILE-CID"></object>'
+            "</body></html>"
+        )
+        message = self._with_parts(html_body)
         message.add_attachment(b"PNGDATA", maintype="image", subtype="png", filename="logo.png")
+        message.add_attachment(b"PDFDATA", maintype="application", subtype="pdf", filename="doc.pdf")
         for part in message.walk():
             if part.get_filename() == "logo.png":
-                part.replace_header("Content-Disposition", "inline; filename=\"logo.png\"")
-                part["Content-ID"] = "<logo>"
-        message.add_attachment(b"PDFDATA", maintype="application", subtype="pdf", filename="doc.pdf")
+                part.replace_header("Content-Disposition", 'inline; filename="logo.png"')
+                part["Content-ID"] = "<LOGO-CID>"
+            elif part.get_filename() == "doc.pdf":
+                part.replace_header("Content-Disposition", 'inline; filename="doc.pdf"')
+                part["Content-ID"] = "<FILE-CID>"
 
-        with tempfile.TemporaryDirectory() as workspace:
-            self._emlx(workspace, 7, message)
-            original_find = mail_index.find_message_file
-            mail_index.find_message_file = lambda identifier: os.path.join(workspace, "7.emlx")
-            try:
-                written, skipped = mail_index.extract_attachments(7)
-            finally:
-                mail_index.find_message_file = original_find
+        written, skipped = self._classify(message)
         self.assertEqual(written, ["doc.pdf"])
         self.assertEqual(skipped, ["logo.png"])
+
+    def test_attachment_without_html_body_is_kept(self):
+        message = email.message.EmailMessage()
+        message["Subject"] = "Plain"
+        message.set_content("body")
+        message.add_attachment(b"DATA", maintype="application", subtype="pdf", filename="doc.pdf")
+        for part in message.walk():
+            if part.get_filename() == "doc.pdf":
+                part.replace_header("Content-Disposition", 'inline; filename="doc.pdf"')
+                part["Content-ID"] = "<ORPHAN>"
+        written, skipped = self._classify(message)
+        self.assertEqual((written, skipped), (["doc.pdf"], []))
+
+    def _classify(self, message):
+        with tempfile.TemporaryDirectory() as workspace:
+            self._emlx(workspace, 7, message)
+            original = mail_index.find_message_file
+            mail_index.find_message_file = lambda identifier: os.path.join(workspace, "7.emlx")
+            try:
+                return mail_index.extract_attachments(7)
+            finally:
+                mail_index.find_message_file = original
 
 
 class ConfigurationTests(unittest.TestCase):
