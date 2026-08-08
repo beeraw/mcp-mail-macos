@@ -83,44 +83,6 @@ def list_messages(
 
 
 @mcp.tool()
-def search_messages(
-    query: str,
-    mailbox: str | None = None,
-    account: str | None = None,
-    field: str = "all",
-    limit: int = 20,
-    scan_limit: int = 300,
-    body_scan_limit: int = 25,
-) -> dict[str, Any]:
-    """Search recent messages of a mailbox by keyword.
-
-    All the words in the query must be present, case-insensitively. The search
-    covers a window of recent messages rather than the whole mailbox, and the
-    answer reports how many messages were actually looked at: Mail's own search
-    walks every message and takes minutes on a few thousand of them.
-
-    Args:
-        query: words to look for.
-        mailbox: mailbox to search; defaults to the unified inbox.
-        account: account name.
-        field: "all" (subject, sender, then bodies), "subject", "sender" or "body".
-        limit: how many messages to return.
-        scan_limit: how many recent messages to pull in (max 2000).
-        body_scan_limit: how many bodies may be read, about a second each.
-    """
-    return _guard(
-        mail_tools.search_messages,
-        query=query,
-        mailbox=mailbox,
-        account=account,
-        field=field,
-        limit=limit,
-        scan_limit=scan_limit,
-        body_scan_limit=body_scan_limit,
-    )
-
-
-@mcp.tool()
 def search_all(
     query: str,
     account: str | None = None,
@@ -133,9 +95,9 @@ def search_all(
 ) -> dict[str, Any]:
     """Search every message of every account, from the local index.
 
-    Prefer this over search_messages: it covers the whole archive in
-    milliseconds, where search_messages only reaches recent messages and asks
-    Mail directly. The index is built by mail_index.py; if it is missing or
+    This is the only way to search: it covers the whole archive in
+    milliseconds, and it never asks Mail, which serves every request on its
+    interface thread. The index is built by mail_index.py; if it is missing or
     stale, index_status says so and sync_index refreshes it.
 
     Subject, sender, recipients, body and attachment names are all searched.
@@ -199,7 +161,7 @@ def get_message(message_id: str, max_body_chars: int = 20000) -> dict[str, Any]:
     """Fetch a message in full: body, headers and attachment list.
 
     Args:
-        message_id: identifier returned by list_messages or search_messages.
+        message_id: identifier returned by list_messages or search_all.
         max_body_chars: body characters to keep; the answer says whether it was cut.
     """
     return _guard(mail_tools.get_message, message_id=message_id, max_body_chars=max_body_chars)

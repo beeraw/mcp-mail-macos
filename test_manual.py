@@ -21,6 +21,7 @@ import sys
 import time
 from typing import Any, Callable
 
+import mail_search
 import mail_tools
 
 PASSED = 0
@@ -115,16 +116,14 @@ def run_read_tests(account: str | None, mailbox: str | None) -> None:
                 break
         if word:
             check(
-                f"search_messages (subject, {word!r})",
-                lambda: mail_tools.search_messages(
-                    word, mailbox=mailbox, account=account, field="subject", limit=5, scan_limit=100
-                ),
+                f"search_all (subject, {word!r})",
+                lambda: mail_search.search_all(f"subject: {word}", account=account, limit=5),
             )
 
     check(
-        "search_messages (unknown mailbox, expected to fail cleanly)",
+        "list_messages (unknown mailbox, expected to fail cleanly)",
         lambda: _expect_error(
-            lambda: mail_tools.search_messages("x", mailbox="___no_such_mailbox___"),
+            lambda: mail_tools.list_messages(mailbox="___no_such_mailbox___"),
             "mailbox_not_found",
         ),
     )

@@ -247,13 +247,20 @@ or sent from another account.
 | --- | --- |
 | `list_mailboxes(include_totals)` | Accounts and mailboxes, with unread counts |
 | `list_messages(mailbox, account, limit, unread_only, include_preview, scan_limit)` | Messages of one mailbox, newest first |
-| `search_messages(query, mailbox, account, field, limit, scan_limit, body_scan_limit)` | Search Mail directly, bounded to recent messages |
 | `get_message(message_id, max_body_chars)` | Full message: body, headers, attachments |
 | `count_unread(mailbox, account)` | Unread counts, per mailbox or across accounts |
 
 These ask Mail directly, so they see the real state including what has just
-arrived. `search_messages` is the fallback for when the index is missing or
-stale; day to day `search_all` supersedes it.
+arrived.
+
+There is deliberately no tool that searches through Mail. Mail serves Apple
+events on the thread that draws its interface, so any search wide enough to be
+useful freezes the app for minutes — and the timeout does not rescue it: killing
+`osascript` leaves Mail chewing on the event it already accepted, so the freeze
+outlives the call. Search goes through the index, which reads the same store
+from disk and needs the same Full Disk Access. If the index is missing,
+`search_all` says so and `sync_index` builds it; there is no faster path worth
+having.
 
 ### Prepare a message for review
 
@@ -497,9 +504,10 @@ an M4 Pro MacBook Pro against real accounts.
 | One message body | ~1.7 s | ~1.7 s |
 | A mailbox's `unread count` | instant | instant |
 
-This dictates the defaults: `include_preview` and `include_totals` are off,
-`search_messages` bounds itself to a window of recent messages and reports what
-it actually scanned, and general search goes through the index.
+This dictates the defaults: `include_preview` and `include_totals` are off, a
+single `list_messages` call reads at most twenty previews however many messages
+it returns and says so in the answer, and search goes through the index rather
+than through Mail.
 
 ### What Mail cannot do at all
 
