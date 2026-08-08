@@ -31,6 +31,12 @@ COMMON_SCRIPT = "_common"
 DEFAULT_TIMEOUT = config.get("applescript_timeout")
 WRITE_TIMEOUT = config.get("applescript_write_timeout")
 
+# How many message bodies list_messages may read for its previews. Mail serves
+# Apple events on the thread that draws its interface, so a request for two
+# hundred previews freezes it for minutes — and the timeout below does not
+# rescue it: killing osascript leaves Mail chewing on the event it accepted.
+PREVIEW_BUDGET = 20
+
 FLAG_COLORS = {
     "red": 0,
     "orange": 1,
@@ -95,7 +101,7 @@ class MessageReference:
             raise MailError(
                 "invalid_message_id",
                 f"Unusable message_id: {token!r}",
-                "Use a message_id returned by list_messages or search_messages.",
+                "Use a message_id returned by list_messages or search_all.",
             ) from exc
 
 
@@ -292,6 +298,9 @@ def list_messages(
     timeout: int = DEFAULT_TIMEOUT,
 ) -> dict[str, Any]:
     limit = max(1, min(int(limit), 200))
+    # A preview costs about a second of frozen Mail, so only the head of the
+    # answer carries one however many messages were asked for.
+    preview_budget = PREVIEW_BUDGET if include_preview else 0
     mailbox_argument = mailbox or ""
     account_argument = account or ""
     # Without a filter the window only has to be as deep as the limit; with one
@@ -310,6 +319,7 @@ def list_messages(
             str(scan_limit),
             "1" if include_preview else "0",
             str(max(20, int(preview_chars))),
+            str(preview_budget),
         ],
         timeout=timeout,
     )
@@ -323,7 +333,8 @@ def list_messages(
     ]
     total = _as_int(_field(meta, 0))
     scanned = _as_int(_field(meta, 1))
-    return {
+    previews_read = _as_int(_field(meta, 3))
+    result = {
         "ok": True,
         "messages": messages,
         "total_in_mailbox": total,
@@ -331,136 +342,13 @@ def list_messages(
         # True when messages older than the window were never looked at.
         "window_truncated": bool(unread_only and scanned < total),
     }
-
-
-def search_messages(
-    query: str,
-    mailbox: str | None = None,
-    account: str | None = None,
-    field: str = "all",
-    limit: int = 20,
-    scan_limit: int = 300,
-    body_scan_limit: int = 25,
-    timeout: int = DEFAULT_TIMEOUT,
-) -> dict[str, Any]:
-    """Searches the most recent messages of a mailbox.
-
-    Mail's own "whose" search is not used: it walks the whole mailbox inside
-    Mail and takes well over two minutes on a few thousand messages, which no
-    caller can wait for. Instead a bounded window of recent messages is pulled
-    in bulk and filtered here, and bodies are only fetched for the leftover
-    candidates. Coverage is reported so the caller knows what was searched.
-    """
-    field = field.lower().strip()
-    if field not in {"all", "subject", "sender", "body"}:
-        raise MailError(
-            "invalid_field",
-            f"Unknown field: {field!r}",
-            "Use one of: all, subject, sender, body.",
-        )
-    if not query.strip():
-        raise MailError("empty_query", "The query is empty.")
-
-    limit = max(1, min(int(limit), 100))
-    scan_limit = max(limit, min(int(scan_limit), 2000))
-    body_scan_limit = max(0, min(int(body_scan_limit), 200))
-    mailbox_argument = mailbox or ""
-    account_argument = account or ""
-    tokens = [token.lower() for token in query.split() if token]
-
-    def matches(*values: str) -> bool:
-        haystack = " ".join(values).lower()
-        return all(token in haystack for token in tokens)
-
-    raw = run_script(
-        "list_messages",
-        [
-            account_argument,
-            mailbox_argument,
-            str(scan_limit),
-            "0",
-            str(scan_limit),
-            "0",
-            "200",
-        ],
-        timeout=timeout,
-    )
-    records = _parse_records(raw)
-    if not records:
-        return {"ok": True, "messages": [], "scanned": 0, "bodies_scanned": 0, "query": query}
-
-    meta = records[0]
-    rows = records[1:]
-    total = _as_int(_field(meta, 0))
-    scanned = _as_int(_field(meta, 1))
-
-    hits: list[dict[str, Any]] = []
-    leftovers: list[Sequence[str]] = []
-    for row in rows:
-        subject = _field(row, 1)
-        sender = _field(row, 2)
-        if field == "subject":
-            candidate = matches(subject)
-        elif field == "sender":
-            candidate = matches(sender)
-        elif field == "body":
-            candidate = False
-        else:
-            candidate = matches(subject, sender)
-        if candidate:
-            if len(hits) < limit:
-                hits.append(_message_from_row(row, account_argument, mailbox_argument))
-        elif field in {"all", "body"}:
-            leftovers.append(row)
-
-    bodies_scanned = 0
-    body_budget_exhausted = False
-    if field in {"all", "body"} and len(hits) < limit and body_scan_limit and leftovers:
-        window = leftovers[:body_scan_limit]
-        body_budget_exhausted = len(leftovers) > body_scan_limit
-        positions = [_field(row, 9) for row in window]
-        body_raw = run_script(
-            "get_bodies",
-            [
-                account_argument,
-                mailbox_argument,
-                _join_list(positions),
-                "4000",
-            ],
-            timeout=timeout,
-        )
-        bodies = {
-            _as_int(_field(record, 0)): _field(record, 1) for record in _parse_records(body_raw)
-        }
-        bodies_scanned = len(bodies)
-        for row in window:
-            if len(hits) >= limit:
-                break
-            body = bodies.get(_as_int(_field(row, 9)), "")
-            if body and matches(body):
-                hits.append(_message_from_row(row, account_argument, mailbox_argument))
-        hits.sort(key=lambda message: message["date_received"], reverse=True)
-
-    result = {
-        "ok": True,
-        "query": query,
-        "field": field,
-        "messages": hits,
-        "scanned": scanned,
-        "total_in_mailbox": total,
-        "bodies_scanned": bodies_scanned,
-        "coverage": "recent_window",
-    }
-    if scanned < total:
-        result["note"] = (
-            f"Only the {scanned} most recent messages of {total} were searched. "
-            "Raise scan_limit to go further back."
-        )
-    if body_budget_exhausted:
-        result["body_note"] = (
-            f"Bodies were only read for {body_scan_limit} messages of the window; "
-            "reading a body costs about a second each."
-        )
+    if include_preview:
+        result["previews_read"] = previews_read
+        if len(messages) > previews_read:
+            result["preview_note"] = (
+                f"Only the first {previews_read} messages carry a preview: reading one "
+                "costs about a second of frozen Mail. Use get_message for the rest."
+            )
     return result
 
 

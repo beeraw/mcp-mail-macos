@@ -5,13 +5,19 @@
 --       5 = scan window size (how many recent messages are looked at)
 --       6 = includePreview ("0" or "1")
 --       7 = preview length in characters
+--       8 = how many previews may be read at most
 --
--- First record: total message count, window size actually scanned, rows returned.
--- Then one messageRow per message.
+-- First record: total message count, window size actually scanned, rows
+-- returned, previews read. Then one messageRow per message.
 --
 -- Properties are read with plural references ("subject of messages 1 thru n")
 -- rather than in a loop: that is one Apple event per property instead of one
 -- per message, and it is several times faster on a large mailbox.
+--
+-- A preview has no such trick: "content" has to be asked message by message,
+-- about a second each, and Mail serves those on the thread that draws its
+-- interface. Hence the budget on argv 8 — past it, previews come back empty
+-- rather than freezing Mail for minutes.
 
 on run argv
 	set accountName to item 1 of argv
@@ -21,6 +27,7 @@ on run argv
 	set windowSize to (item 5 of argv) as integer
 	set includePreview to (item 6 of argv) is "1"
 	set previewLength to (item 7 of argv) as integer
+	set previewBudget to (item 8 of argv) as integer
 
 	set theMailbox to my resolveMailbox(accountName, mailboxPathText)
 	tell application "Mail"
@@ -31,7 +38,7 @@ on run argv
 		end try
 		set totalCount to count of messages of theMailbox
 		if totalCount is 0 then
-			return my joinText({"0", "0", "0"}, my fieldSep())
+			return my joinText({"0", "0", "0", "0"}, my fieldSep())
 		end if
 		if windowSize > totalCount then set windowSize to totalCount
 		if windowSize < 1 then set windowSize to 1
@@ -46,12 +53,14 @@ on run argv
 
 	set theRows to {}
 	set returnedCount to 0
+	set previewsRead to 0
 	repeat with i from 1 to windowSize
 		if returnedCount ≥ rowLimit then exit repeat
 		set isRead to item i of readList
 		if (not unreadOnly) or (isRead is false) then
 			set previewText to ""
-			if includePreview then
+			if includePreview and previewsRead < previewBudget then
+				set previewsRead to previewsRead + 1
 				try
 					tell application "Mail"
 						set bodyText to content of message i of theMailbox
@@ -70,6 +79,6 @@ on run argv
 		end if
 	end repeat
 
-	set metaRow to my joinText({totalCount as text, windowSize as text, returnedCount as text}, my fieldSep())
+	set metaRow to my joinText({totalCount as text, windowSize as text, returnedCount as text, previewsRead as text}, my fieldSep())
 	return my joinText({metaRow} & theRows, my recordSep())
 end run
