@@ -1,26 +1,21 @@
 """Drafts written as .eml files, outside Mail.
 
-Mail has no way to send a draft it holds, so anything drafted inside it has to
-be re-posted and then deleted — a delete that the account can undo, and that
-costs a twenty second wait to make stick. Keeping drafts out of Mail removes
-that whole problem: the file is written here, reviewed, and one single message
-is sent from it.
+A file is a better record than a draft. It sits still, it can be opened (macOS
+renders an .eml in Mail), diffed, versioned. And nothing has to go into Mail and
+come back out: the file is written here, reviewed, and submitted as it stands.
 
-The file is also a better record than a draft. It sits still, it can be opened
-(macOS renders an .eml in Mail), diffed, versioned. What gets sent is read back
-from it at send time, so the message that leaves is the one that was reviewed.
+The message is built by mail_draft, the same as a draft filed in Mail and the
+same as a direct send, so the three cannot render differently. Sending is a
+straight SMTP submission of the file's own bytes — no unpacking, no rebuilding,
+so what leaves is what was reviewed, down to the byte.
 """
 
 from __future__ import annotations
 
 import email
 import email.policy
-import email.utils
-import json
-import mimetypes
 import os
 import re
-import tempfile
 import time
 import unicodedata
 from datetime import datetime
@@ -28,7 +23,7 @@ from email.message import EmailMessage
 from typing import Any, Sequence
 
 import config
-from mail_tools import MailError, _as_address_list, _check_attachments, _compose, _confirmation_needed
+from mail_tools import MailError, _as_address_list, _confirmation_needed
 
 # Drafts live inside the project by default, not in the user's home or working
 # directory. See config.py to put them elsewhere.
@@ -94,119 +89,13 @@ def purge_drafts(
             except OSError:
                 continue
 
-    # The same sweep also clears the drafts Mail left behind after a send.
-    mail_drafts: list[str] = []
-    try:
-        mail_drafts = purge_mail_drafts(folder)
-    except Exception:  # noqa: BLE001 - never let this break the file purge
-        pass
-
-    result = {
+    return {
         "ok": True,
         "folder": target_folder,
         "removed": removed,
         "kept_pending_days": pending_days,
         "kept_archive_days": archive_days,
     }
-    if mail_drafts:
-        result["mail_drafts_removed"] = mail_drafts
-    return result
-
-
-# Mail autosaves what it is composing, and with no window to close that autosave
-# is sometimes left behind as a draft — appearing several seconds after the
-# message has already gone, which is why it cannot be cleaned up inline. It is
-# swept later instead, and only when it matches a message this server sent.
-LEDGER_NAME = ".sent-ledger.json"
-LEDGER_WINDOW_HOURS = config.get("ledger_window_hours")
-
-
-def _ledger_path(folder: str | None) -> str:
-    return os.path.join(_resolve_folder(folder), LEDGER_NAME)
-
-
-def _read_ledger(folder: str | None) -> list[dict[str, Any]]:
-    try:
-        with open(_ledger_path(folder), "r", encoding="utf-8") as handle:
-            entries = json.load(handle)
-        return entries if isinstance(entries, list) else []
-    except (OSError, ValueError):
-        return []
-
-
-def record_sent(subject: str, recipients: Sequence[str], folder: str | None = None) -> None:
-    """Notes a message this server sent, so its autosave can be recognised later.
-
-    Nothing is written into the message itself: a marker in the body would be
-    visible to the recipient, and AppleScript cannot set a custom header. The
-    note stays here, next to the drafts.
-    """
-    now = time.time()
-    entries = [
-        entry
-        for entry in _read_ledger(folder)
-        if now - float(entry.get("at", 0)) < LEDGER_WINDOW_HOURS * 3600
-    ]
-    entries.append(
-        {
-            "subject": subject,
-            "to": [address.lower() for address in recipients],
-            "at": now,
-        }
-    )
-    try:
-        with open(_ledger_path(folder), "w", encoding="utf-8") as handle:
-            json.dump(entries, handle, ensure_ascii=False)
-    except OSError:
-        pass
-
-
-def _addresses(text: str) -> set[str]:
-    return {match.lower() for match in re.findall(r"[\w.+-]+@[\w.-]+", text or "")}
-
-
-def purge_mail_drafts(folder: str | None = None) -> list[str]:
-    """Removes drafts Mail left behind after this server sent a message.
-
-    A draft is only removed when it matches a recent send on both subject and
-    recipient. A draft written by hand matches nothing, so it is never touched.
-    """
-    entries = _read_ledger(folder)
-    if not entries:
-        return []
-
-    import mail_tools
-
-    now = time.time()
-    recent = [
-        entry for entry in entries if now - float(entry.get("at", 0)) < LEDGER_WINDOW_HOURS * 3600
-    ]
-    if not recent:
-        return []
-
-    try:
-        drafts = mail_tools.list_messages(mailbox="drafts", limit=25)["messages"]
-    except Exception:  # noqa: BLE001 - Mail may be busy or unreachable
-        return []
-
-    removed: list[str] = []
-    for draft in drafts:
-        candidates = [entry for entry in recent if entry["subject"] == draft["subject"]]
-        if not candidates:
-            continue
-        try:
-            full = mail_tools.get_message(draft["message_id"], max_body_chars=200)
-        except Exception:  # noqa: BLE001
-            continue
-        draft_addresses = _addresses(full.get("to", "")) | _addresses(full.get("cc", ""))
-        if not any(set(entry["to"]) & draft_addresses for entry in candidates):
-            continue
-        try:
-            mail_tools.delete_message(draft["message_id"])
-            removed.append(draft["subject"])
-        except Exception:  # noqa: BLE001
-            continue
-    return removed
 
 
 def _sweep(folder: str | None) -> list[str]:
@@ -219,12 +108,20 @@ def _sweep(folder: str | None) -> list[str]:
 
 def _recap(message: EmailMessage, path: str) -> dict[str, Any]:
     """The summary shown to the user: everything that decides whether to send."""
-    attachments = []
+    attachments: list[dict[str, Any]] = []
+    inline: list[str] = []
     body = ""
     for part in message.walk():
         if part.get_content_maintype() == "multipart":
             continue
         if part.get_filename():
+            # An inline part is not an attachment: the signature logo travels
+            # that way, and announcing it would have the reader expect a file
+            # the recipient never receives.
+            disposition = (part.get("Content-Disposition") or "").lower()
+            if disposition.startswith("inline"):
+                inline.append(part.get_filename())
+                continue
             attachments.append(
                 {
                     "name": part.get_filename(),
@@ -232,7 +129,14 @@ def _recap(message: EmailMessage, path: str) -> dict[str, Any]:
                 }
             )
         elif part.get_content_type() == "text/plain" and not body:
-            body = part.get_content()
+            # Decoded by hand rather than with get_content(): a message just
+            # built here is an ordinary Message, which has no such method, and
+            # only one read back from a file is an EmailMessage.
+            payload = part.get_payload(decode=True)
+            if payload is None:
+                continue
+            charset = part.get_content_charset() or "utf-8"
+            body = payload.decode(charset, errors="replace")
     return {
         "path": path,
         "file": os.path.basename(path),
@@ -243,6 +147,7 @@ def _recap(message: EmailMessage, path: str) -> dict[str, Any]:
         "subject": message.get("Subject") or "",
         "body": body.rstrip(),
         "attachments": attachments,
+        "kept_inline": inline,
         "written_at": message.get("Date") or "",
     }
 
@@ -274,33 +179,23 @@ def write_draft(
     folder: str | None = None,
 ) -> dict[str, Any]:
     """Writes a draft as a self-contained .eml file. Mail is not involved."""
-    recipients = _as_address_list(to)
-    if not recipients:
-        raise MailError("no_recipient", "At least one recipient is required.")
-    attachment_paths = _check_attachments(attachments)
+    import mail_draft
+
     target_folder = _resolve_folder(folder)
-
-    message = EmailMessage()
-    message["From"] = sender or ""
-    message["To"] = ", ".join(recipients)
-    if _as_address_list(cc):
-        message["Cc"] = ", ".join(_as_address_list(cc))
-    if _as_address_list(bcc):
-        message["Bcc"] = ", ".join(_as_address_list(bcc))
-    message["Subject"] = subject
-    message["Date"] = email.utils.formatdate(localtime=True)
-    message.set_content(body)
-
-    for path in attachment_paths:
-        guessed, _ = mimetypes.guess_type(path)
-        maintype, _, subtype = (guessed or "application/octet-stream").partition("/")
-        with open(path, "rb") as handle:
-            message.add_attachment(
-                handle.read(),
-                maintype=maintype,
-                subtype=subtype,
-                filename=os.path.basename(path),
-            )
+    # The same builder as the Mail draft and the direct send, so the three
+    # cannot drift: HTML body, the account's signature, then the attachments.
+    prepared = mail_draft.build(
+        to=to,
+        subject=subject,
+        body=body,
+        cc=cc,
+        bcc=bcc,
+        attachments=attachments,
+        sender=sender,
+    )
+    message = prepared["message"]
+    recipients = prepared["to"]
+    attachment_paths = prepared["attachment_paths"]
 
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     full = os.path.join(target_folder, f"{stamp}-{_slug(subject)}.eml")
@@ -377,39 +272,22 @@ def send_draft_file(path: str, confirm: bool = False, keep_file: bool = False) -
         preview["action"] = "send_draft_file"
         return _confirmation_needed("sending this draft", preview)
 
-    with tempfile.TemporaryDirectory(prefix="mcp-mail-eml-") as workspace:
-        attachment_paths = []
-        for part in message.walk():
-            if part.get_content_maintype() == "multipart" or not part.get_filename():
-                continue
-            safe = os.path.basename(part.get_filename())
-            safe = re.sub(r"[/\\\x00]", "_", safe) or "piece"
-            target = os.path.join(workspace, safe)
-            with open(target, "wb") as handle:
-                handle.write(part.get_payload(decode=True) or b"")
-            attachment_paths.append(target)
+    # The file is submitted as it stands. Nothing is unpacked and recomposed,
+    # so what leaves is what was reviewed, down to the byte — no attachment can
+    # be lost on the way, and the formatting cannot be rebuilt differently.
+    import mail_draft
+    import mail_imap
 
-        if len(attachment_paths) != len(recap["attachments"]):
-            raise MailError(
-                "attachments_incomplete",
-                f"Only {len(attachment_paths)} of {len(recap['attachments'])} attachments could "
-                "be read back from the file; nothing was sent.",
-            )
-
-        _compose(
-            "send",
-            to=recap["to"],
-            subject=recap["subject"],
-            body=recap["body"],
-            cc=recap["cc"],
-            bcc=recap["bcc"],
-            attachments=attachment_paths,
-            sender=recap["from"] or None,
-        )
+    account = mail_draft.resolve_account(recap["from"] or None)
+    envelope = recap["to"] + recap["cc"] + recap["bcc"]
+    # The envelope carries the blind recipients; the message must not name them.
+    del message["Bcc"]
+    delivered = mail_imap.send_message(account["name"], message.as_bytes(), envelope)
 
     result = dict(recap)
     result["ok"] = True
     result["sent"] = True
+    result["account"] = delivered["account"]
 
     if keep_file:
         result["filed_as"] = full

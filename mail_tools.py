@@ -8,11 +8,12 @@ directly from test_manual.py.
 from __future__ import annotations
 
 import base64
+import email
+import email.policy
 import json
 import os
 import re
 import subprocess
-import tempfile
 import time
 from dataclasses import dataclass
 from typing import Any, Iterable, Sequence
@@ -455,76 +456,6 @@ def _check_attachments(attachments: Sequence[str] | None) -> list[str]:
     return paths
 
 
-def _compose(
-    mode: str,
-    to: str | Sequence[str],
-    subject: str,
-    body: str,
-    cc: str | Sequence[str] | None = None,
-    bcc: str | Sequence[str] | None = None,
-    attachments: Sequence[str] | None = None,
-    sender: str | None = None,
-    timeout: int = WRITE_TIMEOUT,
-) -> dict[str, Any]:
-    recipients = _as_address_list(to)
-    if not recipients:
-        raise MailError("no_recipient", "At least one recipient is required.")
-    attachment_paths = _check_attachments(attachments)
-
-    raw = run_script(
-        "compose",
-        [
-            mode,
-            _join_list(recipients),
-            _join_list(_as_address_list(cc)),
-            _join_list(_as_address_list(bcc)),
-            subject,
-            body,
-            _join_list(attachment_paths),
-            sender or "",
-        ],
-        timeout=timeout,
-    )
-    if mode == "send":
-        # Noted so the autosave Mail may leave behind can be recognised and
-        # swept later; it often appears too late to be caught here.
-        try:
-            import mail_files
-
-            mail_files.record_sent(subject, recipients)
-        except Exception:  # noqa: BLE001 - bookkeeping must never fail a send
-            pass
-
-    records = _parse_records(raw)
-    row = records[0] if records else []
-    result: dict[str, Any] = {
-        "ok": True,
-        "mode": mode,
-        "sent": mode == "send",
-        "subject": _field(row, 1, subject),
-        "to": recipients,
-        "cc": _as_address_list(cc),
-        "bcc": _as_address_list(bcc),
-        "attachments": attachment_paths,
-    }
-    if mode == "draft":
-        identifier = _field(row, 4)
-        if identifier:
-            result["message_id"] = MessageReference(
-                account=_field(row, 6),
-                mailbox=_field(row, 5),
-                identifier=_as_int(identifier),
-            ).encode()
-            result["mailbox"] = _field(row, 5)
-            result["account"] = _field(row, 6)
-        else:
-            result["note"] = (
-                "Mail did not hand back an id for the draft; to send it later, find it "
-                "with list_messages(mailbox='drafts')."
-            )
-    return result
-
-
 def send_email(
     to: str | Sequence[str],
     subject: str,
@@ -553,7 +484,18 @@ def send_email(
                 "attachments": [os.path.basename(path) for path in attachment_paths],
             },
         )
-    return _compose("send", to, subject, body, cc, bcc, attachments, sender)
+
+    import mail_draft
+
+    return mail_draft.send(
+        to=to,
+        subject=subject,
+        body=body,
+        cc=cc,
+        bcc=bcc,
+        attachments=attachments,
+        sender=sender,
+    )
 
 
 def create_draft(
@@ -564,8 +506,27 @@ def create_draft(
     bcc: str | Sequence[str] | None = None,
     attachments: Sequence[str] | None = None,
     sender: str | None = None,
+    signature: bool = True,
 ) -> dict[str, Any]:
-    return _compose("draft", to, subject, body, cc, bcc, attachments, sender)
+    """Saves a draft in Mail, built here rather than composed by Mail.
+
+    Mail's own composer cannot produce the message that is wanted: it inserts a
+    break above the body, wraps everything in a cite blockquote and slips the
+    attachments into the text ahead of the signature. So the draft is assembled
+    as MIME and imported. See mail_draft.
+    """
+    import mail_draft
+
+    return mail_draft.create_draft(
+        to=to,
+        subject=subject,
+        body=body,
+        cc=cc,
+        bcc=bcc,
+        attachments=attachments,
+        sender=sender,
+        signature=signature,
+    )
 
 
 def _draft_exists(reference: MessageReference) -> bool:
@@ -609,6 +570,7 @@ def send_draft(message_id: str, confirm: bool = False) -> dict[str, Any]:
     mailbox_path = _field(row, 6)
     account_name = _field(row, 7)
     body = _field(row, 8)
+    rfc_message_id = _field(row, 9)
 
     if not to and not cc and not bcc:
         raise MailError(
@@ -618,18 +580,20 @@ def send_draft(message_id: str, confirm: bool = False) -> dict[str, Any]:
         )
 
     if not confirm:
-        # The draft has been read but not touched: this is the cheapest way to
-        # put its actual content in front of the user before it goes out. The
-        # attachments are classified first, so the preview does not announce a
-        # signature logo as a file the recipient would receive.
+        # The preview describes the message on the server, which is the one that
+        # will be sent — not Mail's idea of it. Mail lists no attachment at all
+        # until it has downloaded the parts, and it counts a signature logo
+        # among them once it has, so neither list can be trusted for this.
         real_names, inline_names = attachment_names, []
-        if attachment_names:
-            try:
-                import mail_index
+        try:
+            import mail_imap
+            import mail_message
 
-                real_names, inline_names = mail_index.extract_attachments(reference.identifier)
-            except Exception:  # noqa: BLE001 - a preview must never fail
-                pass
+            real_names, inline_names = mail_message.classify_parts(
+                mail_imap.fetch_draft(account_name, rfc_message_id)
+            )
+        except Exception:  # noqa: BLE001 - a preview must never fail
+            pass
         return _confirmation_needed(
             "sending this draft",
             {
@@ -646,60 +610,21 @@ def send_draft(message_id: str, confirm: bool = False) -> dict[str, Any]:
             },
         )
 
-    workspace: tempfile.TemporaryDirectory[str] | None = None
-    attachment_paths: list[str] = []
-    inline_parts: list[str] = []
-    if attachment_names:
-        # Mail refuses to export an attachment, so the files are read out of the
-        # stored message. Dropping them silently is not an option.
-        import mail_index
+    # The draft is fetched from the server and submitted as it stands. Nothing
+    # is taken apart and composed again, so the formatting, the signature and
+    # every attachment leave exactly as they were reviewed — and Full Disk
+    # Access is no longer needed to dig the files out of Mail's storage.
+    import mail_imap
 
-        workspace = tempfile.TemporaryDirectory(prefix="mcp-mail-draft-")
-        try:
-            attachment_paths, inline_parts = mail_index.extract_attachments(
-                reference.identifier, workspace.name
-            )
-        except PermissionError as error:
-            workspace.cleanup()
-            raise MailError(
-                "attachments_unreachable",
-                f"The draft carries {len(attachment_names)} attachment(s) that cannot be read back.",
-                "Full Disk Access is needed to re-attach them. Grant it, or open the draft in "
-                "Mail and send it by hand.",
-            ) from error
-        except Exception as error:  # noqa: BLE001 - never send a truncated message
-            workspace.cleanup()
-            raise MailError(
-                "attachments_unreachable",
-                f"The draft's attachments could not be recovered: {error}",
-                "Open the draft in Mail and send it by hand, so nothing is lost.",
-            ) from error
+    import mail_message
 
-        # Mail counts inline parts among the attachments, so the two lists only
-        # have to add up once those are accounted for.
-        if len(attachment_paths) + len(inline_parts) < len(attachment_names):
-            workspace.cleanup()
-            raise MailError(
-                "attachments_incomplete",
-                f"Only {len(attachment_paths)} of {len(attachment_names)} attachments could be "
-                "recovered; nothing was sent.",
-                "Open the draft in Mail and send it by hand, so nothing is lost.",
-            )
-
-    try:
-        _compose(
-            "send",
-            to=to,
-            subject=subject,
-            body=body,
-            cc=cc,
-            bcc=bcc,
-            attachments=attachment_paths,
-            sender=sender or None,
-        )
-    finally:
-        if workspace is not None:
-            workspace.cleanup()
+    raw = mail_imap.fetch_draft(account_name, rfc_message_id)
+    sent_files, inline_files = mail_message.classify_parts(raw)
+    envelope = to + cc + bcc
+    outgoing = email.message_from_bytes(raw, policy=email.policy.default)
+    # The envelope carries the blind recipients; the message must not name them.
+    del outgoing["Bcc"]
+    mail_imap.send_message(account_name, outgoing.as_bytes(), envelope)
 
     result: dict[str, Any] = {
         "ok": True,
@@ -709,41 +634,27 @@ def send_draft(message_id: str, confirm: bool = False) -> dict[str, Any]:
         "to": to,
         "cc": cc,
         "bcc": bcc,
-        "attachments": [os.path.basename(path) for path in attachment_paths],
+        "attachments": sent_files,
         "drafted_in": {"account": account_name, "mailbox": mailbox_path},
     }
-    if inline_parts:
-        # Worth stating: Mail listed these as attachments, they were not sent as such.
-        result["kept_inline"] = inline_parts
+    if inline_files:
+        # Worth stating: Mail lists these as attachments, they went out as part
+        # of the body instead.
+        result["kept_inline"] = inline_files
 
     # Only once the message is gone: a failure here leaves a stray draft, which
     # is recoverable, where the reverse would lose the message.
-    # Deleting once is not enough, and checking once even less. A Gmail account
-    # pushes the draft back from the server several seconds after the local
-    # delete — long after the delete has reported success. So the draft is
-    # watched over a window and deleted again each time it reappears. That is
-    # what makes this call take about twenty seconds; leaving a draft that can
-    # be sent a second time would be the worse trade.
+    removed = False
     removal_error: str | None = None
-    attempts = 0
-    present = True
-    time.sleep(8)
-    for pause in (5, 8):
-        if present:
-            try:
-                _update_message(message_id, "delete")
-                attempts += 1
-            except MailError as error:
-                removal_error = error.code
-        time.sleep(pause)
-        present = _draft_exists(reference)
-
-    result["draft_removed"] = not present
-    result["removal_attempts"] = attempts
-    if present:
+    try:
+        removed = mail_imap.delete_draft(account_name, rfc_message_id)
+    except MailError as error:
+        removal_error = error.code
+    result["draft_removed"] = removed
+    if not removed:
         result["note"] = (
-            "The message was sent, but the draft keeps coming back in Drafts"
-            + (f" ({removal_error})" if removal_error else " — the account restores it from the server")
+            "The message was sent, but the draft is still in Drafts"
+            + (f" ({removal_error})" if removal_error else "")
             + ". Remove it from Mail so it is not sent twice."
         )
     return result
@@ -756,8 +667,13 @@ def reply_to_message(
     send: bool = True,
     confirm: bool = False,
 ) -> dict[str, Any]:
-    reference = MessageReference.decode(message_id)
-    mode = "send" if send else "draft"
+    """Answers a message, staying attached to its thread.
+
+    The reply is built here like every other message, with In-Reply-To and
+    References set from the original, so it threads without going through
+    Mail's own reply command — which opened a compose window and rewrote the
+    body on the way.
+    """
     if send and not confirm:
         original = get_message(message_id, max_body_chars=400)
         return _confirmation_needed(
@@ -772,28 +688,15 @@ def reply_to_message(
                 "body": body,
             },
         )
-    raw = run_script(
-        "reply",
-        [
-            reference.account,
-            reference.mailbox,
-            str(reference.identifier),
-            body,
-            "1" if reply_all else "0",
-            mode,
-        ],
-        timeout=WRITE_TIMEOUT,
+
+    import mail_draft
+
+    return mail_draft.reply(
+        message_id=message_id,
+        body=body,
+        reply_all=reply_all,
+        as_draft=not send,
     )
-    records = _parse_records(raw)
-    row = records[0] if records else []
-    return {
-        "ok": True,
-        "mode": mode,
-        "sent": mode == "send",
-        "subject": _field(row, 1),
-        "recipient_count": _as_int(_field(row, 2)),
-        "reply_all": reply_all,
-    }
 
 
 # --------------------------------------------------------------------------

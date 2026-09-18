@@ -32,8 +32,16 @@ DEFAULTS: dict[str, Any] = {
     # How long a draft may sit on disk before the sweep removes it.
     "pending_retention_days": 7,
     "archive_retention_days": 30,
-    # How long a send stays recorded, so its leftover autosave can be recognised.
-    "ledger_window_hours": 2,
+    # The line introducing the quoted original in a reply. It is read by the
+    # person answered, so it belongs in their language: {date} and {sender} are
+    # filled in. Mail writes its own in the language of the system.
+    "reply_attribution": "On {date}, {sender} wrote:",
+    # How {date} above is written out, in strftime terms.
+    "reply_date_format": "%Y-%m-%d %H:%M",
+    # Where the account passwords live. Mail holds every other server setting,
+    # but not a password a script may read, so one is stored per account under
+    # this service name in the login keychain.
+    "keychain_service": "mcp-mail-macos",
     # The search index, and Mail's storage it is built from.
     "index_path": os.path.join(PROJECT_ROOT, "index.sqlite"),
     "mail_root": os.path.expanduser("~/Library/Mail"),

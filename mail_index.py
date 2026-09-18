@@ -56,7 +56,7 @@ MAILBOX_URL = re.compile(r"^(?P<scheme>imap|ews|local|pop)://(?P<account>[^/]+)/
 
 def find_store() -> str:
     # An ordinary exception, not SystemExit: this is also called from the MCP
-    # server (through extract_attachments), whose guards only catch Exception.
+    # server, whose guards only catch Exception.
     versions = sorted(
         entry for entry in os.listdir(MAIL_ROOT) if entry.startswith("V") and entry[1:].isdigit()
     )
@@ -139,98 +139,6 @@ def scan_message_files(store: str) -> dict[int, str]:
             if identifier.isdigit():
                 files[int(identifier)] = os.path.join(directory, name)
     return files
-
-
-def find_message_file(identifier: int) -> str | None:
-    """Locates one message's .emlx file, stopping as soon as it is found.
-
-    Mail shards messages by id, but the layout is undocumented, so the store is
-    walked instead. Drafts sit in small directories and turn up quickly.
-    """
-    wanted = {f"{identifier}.emlx", f"{identifier}.partial.emlx"}
-    for directory, subdirectories, filenames in os.walk(find_store(), onerror=lambda error: None):
-        subdirectories[:] = [name for name in subdirectories if not name.startswith(".")]
-        for name in filenames:
-            if name in wanted:
-                return os.path.join(directory, name)
-    return None
-
-
-def extract_attachments(identifier: int, destination: str | None = None) -> tuple[list[str], list[str]]:
-    """Writes a message's real attachments to disk.
-
-    Returns the paths written, and the names of the parts deliberately left
-    behind. With no destination, nothing is written and the names are simply
-    classified — which is what a preview needs.
-
-    Mail's own "save" command on an attachment is refused by its sandbox
-    (-10004) whatever the destination, so the parts are read out of the stored
-    message instead. Needs Full Disk Access.
-
-    A signature logo is a part with a file name like any other, but it belongs
-    to the body and Mail counts it among the attachments; re-sending it as one
-    would show the recipient a stray image. Telling the two apart is not
-    obvious: AppleScript inserts a real attachment *into* the body, so it also
-    ends up inline, with a Content-ID, referenced from the HTML. What separates
-    them is how the HTML refers to it — an <img src="cid:…"> is part of the body,
-    while an <object data="cid:…"> is an attachment Mail is merely showing.
-    """
-    path = find_message_file(identifier)
-    if path is None:
-        raise FileNotFoundError(f"No stored file found for message {identifier}")
-    raw = read_raw_message(path)
-    if raw is None:
-        raise ValueError(f"Unreadable message file: {path}")
-
-    message = email.message_from_bytes(raw, policy=email.policy.default)
-
-    # Content-IDs the HTML body displays as images. Those, and only those,
-    # belong to the body rather than to the list of attachments.
-    body_images: set[str] = set()
-    for part in message.walk():
-        if part.get_content_type() != "text/html":
-            continue
-        try:
-            html_text = (part.get_payload(decode=True) or b"").decode(
-                part.get_content_charset() or "utf-8", errors="replace"
-            )
-        except LookupError:
-            continue
-        for cid in re.findall(r"<img[^>]+src=[\"']?cid:([^\"'>\s]+)", html_text, re.IGNORECASE):
-            body_images.add(cid.strip())
-
-    written: list[str] = []
-    skipped: list[str] = []
-    for index, part in enumerate(message.walk()):
-        if part.get_content_maintype() == "multipart":
-            continue
-        filename = part.get_filename()
-        disposition = part.get_content_disposition()
-        if not filename and disposition != "attachment":
-            continue
-        content_id = (part.get("content-id") or "").strip().strip("<>")
-        if disposition != "attachment" and content_id and content_id in body_images:
-            skipped.append(filename or f"piece-{index}")
-            continue
-        payload = part.get_payload(decode=True)
-        if not payload:
-            continue
-        if destination is None:
-            written.append(filename or f"piece-{index}")
-            continue
-        safe = os.path.basename(filename or f"piece-{index}")
-        safe = re.sub(r"[/\\\x00]", "_", safe) or f"piece-{index}"
-        target = os.path.join(destination, safe)
-        # Two attachments can share a name; neither may overwrite the other.
-        stem, extension = os.path.splitext(target)
-        counter = 1
-        while os.path.exists(target):
-            target = f"{stem}-{counter}{extension}"
-            counter += 1
-        with open(target, "wb") as handle:
-            handle.write(payload)
-        written.append(target)
-    return written, skipped
 
 
 def read_raw_message(path: str) -> bytes | None:

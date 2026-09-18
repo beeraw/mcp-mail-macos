@@ -21,7 +21,21 @@ import mail_search
 import mail_tools
 from mail_tools import MailError
 
-mcp = _Server("mail-macos")
+INSTRUCTIONS = """\
+How to write the body of any message this server sends or drafts (send_email,
+create_draft, write_draft, reply_to_message):
+
+- Open with "Bonjour," alone on its line, never followed by the recipient's
+  name ("Bonjour Madame X," and "Bonjour Jean," are both wrong).
+- Close with "Cordialement," alone, comma included. Never "Bien cordialement",
+  "Belle journée" or any other formula: the user changes it themselves when
+  they want to.
+- End the body on "Cordialement,", with no blank line after it and no name,
+  signature or contact details: the account's signature is added by the
+  server, one empty line below.
+"""
+
+mcp = _Server("mail-macos", instructions=INSTRUCTIONS)
 
 
 def _guard(function, *args, **kwargs) -> dict[str, Any]:
@@ -206,7 +220,8 @@ def send_email(
     Args:
         to: one address, a comma-separated string, or a list of addresses.
         subject: subject line.
-        body: plain text body.
+        body: the message body, HTML or plain text; plain text is turned into
+            HTML, so the message always goes out as HTML.
         cc: carbon copy recipients.
         bcc: blind carbon copy recipients.
         attachments: absolute paths of existing files.
@@ -235,17 +250,23 @@ def create_draft(
     bcc: str | Sequence[str] | None = None,
     attachments: Sequence[str] | None = None,
     sender: str | None = None,
+    signature: bool = True,
 ) -> dict[str, Any]:
     """Compose a message and save it to Drafts without sending it.
+
+    The draft is laid out the way Mail lays out its own: the message, then the
+    account's signature, then a blank line, then the attachments.
 
     Args:
         to: one address, a comma-separated string, or a list of addresses.
         subject: subject line.
-        body: plain text body.
+        body: the message body, HTML or plain text; plain text is turned into
+            HTML, so the message always goes out as HTML.
         cc: carbon copy recipients.
         bcc: blind carbon copy recipients.
         attachments: absolute paths of existing files.
         sender: address to send from; without it Mail uses its default account.
+        signature: set to false to leave the account's signature off.
     """
     return _guard(
         mail_tools.create_draft,
@@ -256,6 +277,7 @@ def create_draft(
         bcc=bcc,
         attachments=attachments,
         sender=sender,
+        signature=signature,
     )
 
 
@@ -280,7 +302,8 @@ def write_draft(
     Args:
         to: one address, a comma-separated string, or a list of addresses.
         subject: subject line.
-        body: plain text body.
+        body: the message body, HTML or plain text; plain text is turned into
+            HTML, so the message always goes out as HTML.
         cc: carbon copy recipients.
         bcc: blind carbon copy recipients.
         attachments: absolute paths of existing files; they are embedded in the file.

@@ -165,6 +165,33 @@ restarted.
 Revoking it later breaks nothing: everything already indexed stays searchable,
 only updates stop.
 
+### 3. An account password — writing drafts and sending
+
+Reading mail goes through Mail. Writing one does not: a draft is filed on the
+server over IMAP, and a send is submitted over SMTP. Mail holds the host, the
+port and the user name for both, so the only thing missing is a password it
+will not hand out.
+
+One is stored per account in the login keychain, under the service name in
+`keychain_service`, keyed by the account's own user name:
+
+```bash
+security add-generic-password -U -s mcp-mail-macos -a you@example.com -w 'the password'
+```
+
+On an account with two step verification — every Google account, for one — that
+must be an **app password**, not the account password. Google offers them at
+[myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords).
+If the page answers that the setting is unavailable, two step verification is
+off on that account, or a Workspace administrator has disabled app passwords.
+
+The lookup runs through `/usr/bin/security`, the same tool that stored the
+password, so the keychain grants it without a prompt. A password added by hand
+through Keychain Access is refused until it is allowed once.
+
+An account with no IMAP server — an Exchange or Outlook account — cannot be
+written to this way, and says so rather than failing obscurely.
+
 ---
 
 ## Add to Claude Code
@@ -206,7 +233,9 @@ claude mcp add mail-macos -s user -e MAIL_MCP_DRAFTS_FOLDER="$HOME/Documents/Out
 | `drafts_folder` | `mails/` in the repo | Where `.eml` drafts are written, and where sent ones are filed |
 | `pending_retention_days` | `7` | How long an unsent draft may sit on disk |
 | `archive_retention_days` | `30` | How long a sent draft stays archived |
-| `ledger_window_hours` | `2` | How long a send stays recorded, so its leftover autosave can be recognised |
+| `reply_attribution` | `On {date}, {sender} wrote:` | The line above the quoted original in a reply, in the language of the person answered |
+| `reply_date_format` | `%Y-%m-%d %H:%M` | How `{date}` above is written out, in `strftime` terms |
+| `keychain_service` | `mcp-mail-macos` | Keychain service name the account passwords are stored under |
 | `index_path` | `index.sqlite` in the repo | The search index |
 | `mail_root` | `~/Library/Mail` | Mail's storage, where the index is built from |
 | `index_max_age_minutes` | `10` | Past this age, `search_all` refreshes the index before answering |
@@ -281,7 +310,7 @@ outside Mail.
 | Tool | Purpose |
 | --- | --- |
 | `send_email(to, subject, body, cc, bcc, attachments, sender, confirm)` | Compose and send |
-| `create_draft(to, subject, body, cc, bcc, attachments, sender)` | Save a draft **in Mail**, returns its `message_id` |
+| `create_draft(to, subject, body, cc, bcc, attachments, sender, signature)` | Save a draft **in Mail** |
 | `send_draft(message_id, confirm)` | Send a draft Mail already holds |
 | `reply_to_message(message_id, body, reply_all, send, confirm)` | Reply, staying in the thread |
 
@@ -297,9 +326,21 @@ draft path would push a caller to recompose with `send_email`, which is the
 behaviour worth avoiding in the first place.
 
 `to`, `cc` and `bcc` accept one address, a comma-separated string, or a list.
-`attachments` takes absolute paths to existing files, checked before Mail is
-called. Without `sender`, Mail uses its default account — worth being explicit
-when several accounts coexist.
+`attachments` takes absolute paths to existing files, checked before anything is
+built. Without `sender`, the account Mail lists first is used — worth being
+explicit when several accounts coexist, since the sender decides which signature
+is appended.
+
+**Every message goes out as HTML**, laid out the way Mail lays out its own: the
+message, then the account's signature, then a blank line, then the attachments.
+A plain text body is converted — blank lines become paragraphs, single newlines
+become breaks, and anything resembling markup is escaped — so a caller never has
+to write HTML to get a well-formed message. Pass `signature=false` to leave the
+signature off.
+
+The signature is not configured here. It is read from Mail's own settings for
+the sending account: which signature is selected, its HTML, and the images it
+carries. Editing it in Mail is enough; there is no second copy to keep in step.
 
 ### Organise
 
@@ -317,8 +358,8 @@ when several accounts coexist.
 
 `write_draft` writes a self-contained `.eml` file — attachments embedded — into
 `mails/`. macOS renders an `.eml` in Mail on double-click, so it reads like a
-real message. `send_draft_file` builds the message from that file, so what
-leaves is what was reviewed, then moves the file to `mails/sent/`.
+real message. `send_draft_file` submits that file as it stands, so what
+leaves is byte for byte what was reviewed, then moves it to `mails/sent/`.
 
 This is not a stylistic choice. **Mail cannot send a draft it holds.** Its
 `send` command only understands an outgoing message, not a message sitting in a
@@ -331,8 +372,10 @@ is issued once the send has settled.
 Keeping drafts out of Mail removes the problem rather than working around it.
 Sending becomes a single instant operation with nothing to clean up afterwards.
 
-`send_draft` remains for drafts written by hand inside Mail. It re-posts and
-deletes them, waiting for the sync to settle, which takes about twenty seconds.
+`send_draft` remains for drafts that already sit in Mail, whether written by
+hand or filed there by `create_draft`. It fetches the message from the server,
+submits it unchanged and expunges the draft — so the formatting, the signature
+and every attachment survive, and the deleted draft does not come back.
 
 **Retention.** An unsent draft is removed after 7 days, an archived one after
 30. The sweep runs on every write, every listing, and from `sync_index`, so a
@@ -513,51 +556,49 @@ than through Mail.
 
 - **Send a draft it holds.** `send` only understands an outgoing message
   (-1708). Opening the draft produces one only after an unpredictable delay,
-  sometimes over a minute. Moving it to the Outbox does nothing. Hence `.eml`
-  files, and hence `send_draft` re-posting and deleting. The only faithful
-  alternative reported by the community is GUI scripting (`Cmd+Shift+D` through
-  System Events), which needs Accessibility permission and breaks with any
-  interface change — deliberately not taken here.
+  sometimes over a minute. Moving it to the Outbox does nothing. The only
+  faithful alternative reported by the community is GUI scripting
+  (`Cmd+Shift+D` through System Events), which needs Accessibility permission
+  and breaks with any interface change — deliberately not taken here. So a send
+  does not go through Mail at all: the message is submitted over SMTP, through
+  the account's own outgoing server.
+- **Compose a message without rewriting it.** Setting `html content` on an
+  outgoing message makes Mail wrap the body in its share wrapper — a stray
+  `<br>` above the first line, inside a `<blockquote type="cite">` — and an
+  attachment made through `make new attachment` lands *inside* that body, ahead
+  of the signature. Neither is reachable from AppleScript, and both survive
+  every ordering of the calls, a full HTML document, and setting the property
+  after `save`. So messages are built as MIME here and handed to the server.
 - **Delete a mailbox.** `delete mailbox` fails with -10000 whatever the syntax.
   A mailbox created by `create_mailbox` has to be removed by hand.
-- **Export an attachment.** Mail refuses to write the file anywhere (-10004), so
-  `send_draft` reads attachments out of the stored `.emlx`, which needs Full Disk
-  Access. Without it, it refuses to send rather than send a message missing its
-  files.
-- **Set headers on an outgoing message.** There is no way to build an
-  `In-Reply-To` by hand, which is why `reply_to_message` goes through Mail's own
-  `reply` command — briefly opening a compose window. That is the only way to get
-  a reply properly attached to its thread.
+- **Export an attachment.** Mail refuses to write the file anywhere (-10004).
+  This no longer matters for sending: `send_draft` fetches the whole message
+  from the server and submits it unchanged, so the attachments never have to be
+  read back out of Mail's storage.
+- **Set headers on an outgoing message.** `In-Reply-To` and `References` cannot
+  be set on a message Mail composes, which used to force `reply_to_message`
+  through Mail's own `reply` command — opening a compose window and rewriting
+  the body. Building the message here sets them directly instead.
 - **Create a mailbox with an `account` property.** It has to happen inside a
   `tell` block targeting the account, or -10000.
-- **Send HTML reliably.** Bodies go out as plain text. A hand-written rich-text
-  draft loses its formatting through `send_draft`.
+- **Delete a draft for good.** A Gmail account pushes back a draft deleted
+  through Mail a few seconds after the delete reports success. Expunged on the
+  server, it is gone — which is how `send_draft` removes it.
 
 ### Behaviours worth knowing
 
-- **Mail autosaves what it composes.** With no window to close, that autosave is
-  *sometimes* left behind as a draft once the message has gone — intermittently,
-  depending on whether the timer fired before the send. It often appears several
-  seconds after the send, too late to be cleaned up inline. The server records
-  what it sends in `mails/.sent-ledger.json`, and the sweep removes drafts
-  matching a recent send on **both** subject and recipient. A hand-written draft
-  matches nothing and is never touched.
-- **A Gmail account restores a deleted draft.** Deleting during the sync that
-  follows a send reports success, then the server pushes the draft back a few
-  seconds later. The same delete issued once the send has settled sticks
-  permanently. That is why `send_draft` waits before deleting.
-- **Outgoing messages accumulate** in Mail's internal list, even after being
-  sent, and cannot be closed through AppleScript. They are invisible, and cleared
-  by restarting Mail. This matters because identifying a compose window by
-  position rather than by id will eventually pick the wrong one — and send it.
-- **Mail counts a signature image among the attachments**, and telling it apart
-  from a real one is not obvious. AppleScript can only add an attachment *into*
-  the body, so a file ends up inline, with a Content-ID, referenced from the
-  HTML — exactly like a signature logo. Skipping every inline part therefore
-  drops real attachments without a word. The discriminator is how the HTML
-  refers to it: `<img src="cid:…">` belongs to the body, while
-  `<object data="cid:…">` is a file Mail is merely displaying. What was left
-  behind is reported under `kept_inline`.
+- **Mail never composes here any more**, so the autosaves it used to leave
+  behind after a send, and the outgoing messages that accumulated invisibly in
+  its internal list, no longer happen at all. The sweep that hunted them down
+  is gone with them.
+- **Mail counts a signature image among the attachments**, so a preview built
+  from Mail's own list announces an image the recipient never receives as a
+  file — and lists nothing at all before Mail has downloaded the parts. What a
+  preview describes is therefore the message on the server, with each part
+  settled by its disposition: an attachment is offered, an inline part belongs
+  to the body. For a message written elsewhere that says neither, a part the
+  HTML shows with `<img src="cid:…">` is taken as part of the body. What was
+  left behind is reported under `kept_inline`.
 - **Gmail labels are mailboxes**, and one message appears in several. `INBOX` can
   resolve to All Mail: a message's `mailbox` field reports where Mail sees it,
   which is not always what was queried.
@@ -605,7 +646,8 @@ exist for Mail, and therefore not for search either.
 
 Unit tests cover everything that does not need Mail: identifier encoding,
 address parsing, error classification, AppleScript assembly, `.eml` round-trips,
-retention and the ledger. They run anywhere, in under a second:
+retention, message layout and reply threading. They run anywhere, in under a
+second:
 
 ```bash
 python3 -m unittest discover -s tests -t .
@@ -632,6 +674,10 @@ be deleted by hand, since Mail cannot do it through AppleScript.
 mcp-mail-macos/
 ├── server.py           # MCP entry point, the 25 tool definitions
 ├── mail_tools.py       # driving Mail through AppleScript
+├── mail_message.py     # building the message: body, signature, attachments
+├── mail_signature.py   # the signature Mail would have used, from its settings
+├── mail_draft.py       # drafting and sending, on top of the two above
+├── mail_imap.py        # the account's own server, for filing and sending
 ├── mail_files.py       # .eml drafts, retention, leftover sweep
 ├── mail_search.py      # querying the index
 ├── mail_index.py       # building and updating the index

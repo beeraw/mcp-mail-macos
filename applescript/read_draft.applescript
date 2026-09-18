@@ -1,6 +1,9 @@
 -- argv: 1 = account name, 2 = mailbox path, 3 = message id
 -- Returns one record: subject, sender, to, cc, bcc, attachment names,
--- mailbox path, account, body.
+-- mailbox path, account, body, RFC message id.
+--
+-- The last field is what lets the draft be found again on the server, where it
+-- can be sent whole rather than taken apart and composed again.
 --
 -- Refuses anything that is not a draft. The role is checked against Mail's
 -- unified drafts mailbox rather than against a name, since the folder is
@@ -48,6 +51,11 @@ on run argv
 			set theBody to content of theMessage
 		end try
 		if theBody is missing value then set theBody to ""
+		set rfcIdentifier to ""
+		try
+			set rfcIdentifier to message id of theMessage
+		end try
+		if rfcIdentifier is missing value then set rfcIdentifier to ""
 
 		set attachmentNames to {}
 		try
@@ -58,7 +66,7 @@ on run argv
 			end repeat
 		end try
 
-		set theFields to {my cleanField(theSubject), my cleanField(theSender), my cleanField(my joinAddresses(to recipients of theMessage)), my cleanField(my joinAddresses(cc recipients of theMessage)), my cleanField(my joinAddresses(bcc recipients of theMessage)), my cleanField(my joinText(attachmentNames, "; ")), my cleanField(holdingPath), my cleanField(holdingAccount), my cleanField(theBody)}
+		set theFields to {my cleanField(theSubject), my cleanField(theSender), my cleanField(my joinAddresses(to recipients of theMessage)), my cleanField(my joinAddresses(cc recipients of theMessage)), my cleanField(my joinAddresses(bcc recipients of theMessage)), my cleanField(my joinText(attachmentNames, "; ")), my cleanField(holdingPath), my cleanField(holdingAccount), my cleanField(theBody), my cleanField(rfcIdentifier)}
 	end tell
 	return my joinText(theFields, my fieldSep())
 end run
