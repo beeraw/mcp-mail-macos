@@ -5,6 +5,7 @@
   "pending_retention_days": 7,
   "archive_retention_days": 30,
   "reply_attribution": "On {date}, {sender} wrote:",
+  "reply_date_format": "%Y-%m-%d %H:%M",
   "keychain_service": "mcp-mail-macos",
 
   "index_path": "~/Library/Application Support/mcp-mail-macos/index.sqlite",
