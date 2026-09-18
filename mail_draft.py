@@ -285,6 +285,7 @@ def reply(
     message_id: str,
     body: str,
     reply_all: bool = False,
+    attachments: Sequence[str] | None = None,
     as_draft: bool = False,
     signature: bool = True,
 ) -> dict[str, Any]:
@@ -352,6 +353,7 @@ def reply(
         # HTML already and the plain body would go out with its newlines lost.
         body=mail_message.to_html(body) + _quoted_original(original),
         cc=copies,
+        attachments=attachments,
         sender=from_address or None,
         signature=signature,
         as_draft=as_draft,

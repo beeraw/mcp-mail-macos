@@ -409,18 +409,20 @@ def reply_to_message(
     message_id: str,
     body: str,
     reply_all: bool = False,
+    attachments: list[str] | None = None,
     send: bool = True,
     confirm: bool = False,
 ) -> dict[str, Any]:
     """Reply to an existing message, keeping it in the same thread.
 
-    Mail briefly opens a compose window to build the reply; that is the only way
-    to get the threading headers filled in.
+    The reply is built by the server with its threading headers set from the
+    original, so Mail opens no compose window.
 
     Args:
         message_id: identifier of the message being answered.
         body: the answer, inserted above the quoted original.
         reply_all: also answer the other recipients.
+        attachments: absolute paths of existing files.
         send: send straight away; set to false to leave the reply in Drafts.
         confirm: required when send is true. Without it, who the reply would go
             to comes back as a preview and nothing is sent.
@@ -430,6 +432,7 @@ def reply_to_message(
         message_id=message_id,
         body=body,
         reply_all=reply_all,
+        attachments=attachments,
         send=send,
         confirm=confirm,
     )
