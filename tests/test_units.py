@@ -21,9 +21,13 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config
+import mail_draft
 import mail_files
+import mail_imap
 import mail_index
+import mail_message
 import mail_search
+import mail_signature
 import mail_tools
 from mail_tools import MailError, MessageReference
 
@@ -131,7 +135,9 @@ class ScriptAssemblyTests(unittest.TestCase):
             for name in os.listdir(directory)
             if name.endswith(".applescript") and not name.startswith("_")
         ]
-        self.assertGreater(len(names), 10)
+        # A floor, not a count: it guards against an empty or unreadable
+        # directory, and must not have to move every time a script goes away.
+        self.assertGreaterEqual(len(names), 8)
         for name in names:
             with self.subTest(script=name):
                 self.assertIn("with timeout of", mail_tools._build_script(name, 30))
@@ -270,6 +276,49 @@ class DraftFileTests(unittest.TestCase):
             self._write(to="")
         self.assertEqual(caught.exception.code, "no_recipient")
 
+    def test_html_body_is_labelled_html(self):
+        written = self._write(body="<p>Hello,</p><ul><li>one</li></ul>")
+        with open(written["path"], "rb") as handle:
+            message = email.message_from_binary_file(handle, policy=email.policy.default)
+        body = message.get_body(preferencelist=("html",))
+        self.assertIsNotNone(body, "a HTML body must not be posted as text/plain")
+        self.assertIn("<li>one</li>", body.get_content())
+
+    def test_plain_body_is_turned_into_html(self):
+        # Every message goes out as HTML, so a plain text body is converted
+        # rather than posted as text/plain: blank lines become empty lines and
+        # single newlines become breaks.
+        written = self._write(body="Hello,\n\nfirst\nsecond\n\nCordialement,")
+        with open(written["path"], "rb") as handle:
+            message = email.message_from_binary_file(handle, policy=email.policy.default)
+        html = message.get_body(preferencelist=("html",))
+        self.assertIsNotNone(html, "a plain body must still be posted as HTML")
+        content = html.get_content()
+        self.assertIn("<div>Hello,</div><div><br></div><div>first", content)
+        self.assertIn("first<br>second", content)
+        # And a plain text alternative stays there for a reader without HTML.
+        plain = message.get_body(preferencelist=("plain",))
+        self.assertIsNotNone(plain)
+        self.assertIn("first\nsecond", plain.get_content())
+
+    def test_markup_in_a_plain_body_is_escaped(self):
+        # "<3" must reach the reader as written, not as a broken tag.
+        written = self._write(body="Merci <3 & bonne journee")
+        with open(written["path"], "rb") as handle:
+            message = email.message_from_binary_file(handle, policy=email.policy.default)
+        content = message.get_body(preferencelist=("html",)).get_content()
+        self.assertIn("&lt;3", content)
+        self.assertIn("&amp;", content)
+
+    def test_body_opens_the_message_with_no_break_before_it(self):
+        # The stray break Mail used to insert above the body is what this
+        # guards against: the document opens on the first paragraph.
+        written = self._write(body="Bonjour,")
+        with open(written["path"], "rb") as handle:
+            message = email.message_from_binary_file(handle, policy=email.policy.default)
+        content = message.get_body(preferencelist=("html",)).get_content()
+        self.assertRegex(content, r"<body>\s*<div>Bonjour,</div>")
+
     def test_listing_reports_what_is_waiting(self):
         self._write(subject="First")
         self._write(subject="Second")
@@ -344,45 +393,6 @@ class RetentionTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "folder_not_found")
 
 
-class SentLedgerTests(unittest.TestCase):
-    def setUp(self):
-        self.workspace = tempfile.TemporaryDirectory()
-        self.folder = self.workspace.name
-
-    def tearDown(self):
-        self.workspace.cleanup()
-
-    def test_records_and_reads_back(self):
-        mail_files.record_sent("Invoice", ["A@Example.com"], self.folder)
-        entries = mail_files._read_ledger(self.folder)
-        self.assertEqual(len(entries), 1)
-        self.assertEqual(entries[0]["subject"], "Invoice")
-        self.assertEqual(entries[0]["to"], ["a@example.com"])
-
-    def test_old_entries_are_dropped_when_writing(self):
-        mail_files.record_sent("Ancient", ["a@b.fr"], self.folder)
-        entries = mail_files._read_ledger(self.folder)
-        entries[0]["at"] = time.time() - (mail_files.LEDGER_WINDOW_HOURS + 1) * 3600
-        with open(mail_files._ledger_path(self.folder), "w", encoding="utf-8") as handle:
-            import json
-
-            json.dump(entries, handle)
-
-        mail_files.record_sent("Recent", ["c@d.fr"], self.folder)
-        subjects = [entry["subject"] for entry in mail_files._read_ledger(self.folder)]
-        self.assertEqual(subjects, ["Recent"])
-
-    def test_sweep_does_nothing_without_a_ledger(self):
-        # No ledger means no candidate, so Mail is never contacted.
-        self.assertEqual(mail_files.purge_mail_drafts(self.folder), [])
-
-    def test_address_extraction(self):
-        self.assertEqual(
-            mail_files._addresses("Ada Lovelace <Ada.Lovelace@Example.com>, b@c.fr"),
-            {"ada.lovelace@example.com", "b@c.fr"},
-        )
-
-
 class StoredMessageTests(unittest.TestCase):
     """Reading Mail's .emlx container and classifying its parts."""
 
@@ -411,65 +421,6 @@ class StoredMessageTests(unittest.TestCase):
             with open(path, "w", encoding="utf-8") as handle:
                 handle.write("not a byte count\n")
             self.assertIsNone(mail_index.read_raw_message(path))
-
-    def _with_parts(self, html_body):
-        """A message shaped the way Mail stores one: everything inline, with cids."""
-        message = email.message.EmailMessage()
-        message["Subject"] = "Stored"
-        message.set_content("body")
-        message.add_alternative(html_body, subtype="html")
-        return message
-
-    def test_body_image_is_skipped_but_an_inline_attachment_is_kept(self):
-        """The regression behind a silent attachment loss.
-
-        AppleScript inserts an attachment into the body, so Mail stores it
-        inline with a Content-ID — exactly like a signature logo. Skipping every
-        inline part therefore dropped real attachments without a word. What
-        separates them is the HTML: <img> for the body, <object> for a file.
-        """
-        html_body = (
-            '<html><body>text'
-            '<img alt="logo.png" src="cid:LOGO-CID">'
-            '<object type="application/x-apple-msg-attachment" data="cid:FILE-CID"></object>'
-            "</body></html>"
-        )
-        message = self._with_parts(html_body)
-        message.add_attachment(b"PNGDATA", maintype="image", subtype="png", filename="logo.png")
-        message.add_attachment(b"PDFDATA", maintype="application", subtype="pdf", filename="doc.pdf")
-        for part in message.walk():
-            if part.get_filename() == "logo.png":
-                part.replace_header("Content-Disposition", 'inline; filename="logo.png"')
-                part["Content-ID"] = "<LOGO-CID>"
-            elif part.get_filename() == "doc.pdf":
-                part.replace_header("Content-Disposition", 'inline; filename="doc.pdf"')
-                part["Content-ID"] = "<FILE-CID>"
-
-        written, skipped = self._classify(message)
-        self.assertEqual(written, ["doc.pdf"])
-        self.assertEqual(skipped, ["logo.png"])
-
-    def test_attachment_without_html_body_is_kept(self):
-        message = email.message.EmailMessage()
-        message["Subject"] = "Plain"
-        message.set_content("body")
-        message.add_attachment(b"DATA", maintype="application", subtype="pdf", filename="doc.pdf")
-        for part in message.walk():
-            if part.get_filename() == "doc.pdf":
-                part.replace_header("Content-Disposition", 'inline; filename="doc.pdf"')
-                part["Content-ID"] = "<ORPHAN>"
-        written, skipped = self._classify(message)
-        self.assertEqual((written, skipped), (["doc.pdf"], []))
-
-    def _classify(self, message):
-        with tempfile.TemporaryDirectory() as workspace:
-            self._emlx(workspace, 7, message)
-            original = mail_index.find_message_file
-            mail_index.find_message_file = lambda identifier: os.path.join(workspace, "7.emlx")
-            try:
-                return mail_index.extract_attachments(7)
-            finally:
-                mail_index.find_message_file = original
 
 
 class ConfigurationTests(unittest.TestCase):
@@ -550,6 +501,248 @@ class ConfirmationGuardTests(unittest.TestCase):
         with self.assertRaises(MailError) as caught:
             mail_tools.send_email(to="", subject="x", body="y")
         self.assertEqual(caught.exception.code, "no_recipient")
+
+
+class MessageLayoutTests(unittest.TestCase):
+    """The order asked for: message, signature, blank line, attachments."""
+
+    def setUp(self):
+        self.workspace = tempfile.TemporaryDirectory()
+        self.attachment = os.path.join(self.workspace.name, "note.txt")
+        with open(self.attachment, "w", encoding="utf-8") as handle:
+            handle.write("attached content")
+        self.signature = mail_signature.Signature(
+            identifier="SIG-1",
+            name="KDS",
+            html='<span>Jean-Luc Petit</span><img src="cid:LOGO-1">',
+            images=[
+                mail_signature.InlineImage(
+                    content_id="LOGO-1",
+                    maintype="image",
+                    subtype="png",
+                    filename="logo.png",
+                    payload=b"\x89PNG fake",
+                )
+            ],
+        )
+
+    def tearDown(self):
+        self.workspace.cleanup()
+
+    def _build(self, **overrides):
+        arguments = {
+            "to": ["a@b.fr"],
+            "subject": "Layout",
+            "body": "Bonjour,",
+            "signature": self.signature,
+        }
+        arguments.update(overrides)
+        return mail_message.build_message(**arguments)
+
+    def test_signature_follows_the_body(self):
+        html = mail_message.compose_html("Bonjour,", self.signature)
+        self.assertLess(
+            html.index("Bonjour,"),
+            html.index("AppleMailSignature"),
+            "the signature must come after the message, never before",
+        )
+
+    def test_one_empty_line_separates_the_body_from_the_signature(self):
+        # Trailing newlines in the body and the break Mail stores at the top of
+        # a signature used to stack up into two or three empty lines.
+        signature = mail_signature.Signature(
+            identifier="SIG-2",
+            name="KDS",
+            html="<span><br>Jean-Luc Petit<br>SARL KDS</span>",
+            images=[],
+        )
+        html = mail_message.compose_html("Bonjour,\n\nCordialement\n\n\n", signature)
+        self.assertIn(
+            '<div>Cordialement</div><br><div id="AppleMailSignature"><span>Jean-Luc Petit',
+            html,
+        )
+
+    def test_a_html_body_loses_its_trailing_blank_lines(self):
+        html = mail_message.compose_html(
+            "<p>Cordialement<br></p><p><br></p>&nbsp;<br>", self.signature
+        )
+        self.assertIn('<p>Cordialement</p><br><div id="AppleMailSignature">', html)
+
+    def test_a_blank_line_closes_the_signature(self):
+        # What separates the signature from the attachments underneath.
+        html = mail_message.compose_html("Bonjour,", self.signature)
+        self.assertTrue(html.endswith("<br></body></html>"))
+
+    def test_attachments_come_after_everything(self):
+        message = self._build(attachment_paths=[self.attachment])
+        self.assertEqual(message.get_content_type(), "multipart/mixed")
+        parts = message.get_payload()
+        self.assertEqual(parts[0].get_content_type(), "multipart/related")
+        self.assertEqual(parts[-1].get_filename(), "note.txt")
+
+    def test_the_signature_logo_is_not_an_attachment(self):
+        # It travels inside the body, by content id, so the reader is not shown
+        # a file they never received.
+        message = self._build(attachment_paths=[self.attachment])
+        related = message.get_payload()[0]
+        logo = related.get_payload()[-1]
+        self.assertEqual(logo.get("Content-Id"), "<LOGO-1>")
+        self.assertIn("inline", logo.get("Content-Disposition", ""))
+
+    def test_a_message_without_attachment_needs_no_mixed_wrapper(self):
+        self.assertEqual(self._build().get_content_type(), "multipart/related")
+
+    def test_the_body_is_not_wrapped_in_a_quote(self):
+        # Mail wrapped anything it composed in a cite blockquote; nothing here
+        # may reintroduce one.
+        html = mail_message.compose_html("Bonjour,", self.signature)
+        self.assertNotIn("blockquote", html)
+
+
+class ReplyTests(unittest.TestCase):
+    """Threading, recipients and quoting, without touching Mail."""
+
+    def test_a_message_id_is_bracketed_for_the_header(self):
+        self.assertEqual(mail_draft._bracketed("abc@x.fr"), "<abc@x.fr>")
+        self.assertEqual(mail_draft._bracketed("<abc@x.fr>"), "<abc@x.fr>")
+        self.assertEqual(mail_draft._bracketed(""), "")
+
+    def test_a_comma_in_a_display_name_does_not_split_a_recipient(self):
+        self.assertEqual(
+            mail_draft._addresses_of('"Petit, Jean-Luc" <j@x.fr>, a@b.fr'),
+            ["j@x.fr", "a@b.fr"],
+        )
+
+    def test_the_same_address_is_kept_once(self):
+        self.assertEqual(
+            mail_draft._addresses_of("a@b.fr, A@B.FR", "c@d.fr"), ["a@b.fr", "c@d.fr"]
+        )
+
+    def test_a_subject_already_answering_keeps_one_prefix(self):
+        for subject in ("Re: Devis", "RE: Devis", "Ré : Devis", "re:Devis"):
+            with self.subTest(subject=subject):
+                self.assertTrue(mail_draft._ALREADY_A_REPLY.match(subject))
+
+    def test_a_fresh_subject_is_not_mistaken_for_an_answer(self):
+        for subject in ("Devis", "Rebond commercial", "Retard de livraison"):
+            with self.subTest(subject=subject):
+                self.assertIsNone(mail_draft._ALREADY_A_REPLY.match(subject))
+
+    def test_the_chain_of_references_is_read_from_the_headers(self):
+        headers = (
+            "From: a@b.fr\n"
+            "References: <one@x.fr>\n <two@x.fr>\n"
+            "Subject: Devis\n"
+        )
+        found = mail_draft._REFERENCES.search(headers)
+        self.assertIsNotNone(found)
+        self.assertEqual(found.group(1).split(), ["<one@x.fr>", "<two@x.fr>"])
+
+    def test_an_unreadable_date_is_left_as_it_came(self):
+        self.assertEqual(mail_draft._readable_date("pas une date"), "pas une date")
+
+
+class PartClassificationTests(unittest.TestCase):
+    """What the reader actually receives, told apart from what only decorates."""
+
+    def _message(self, image_headers: str, html: str = "") -> bytes:
+        """A message whose image part carries exactly the given headers."""
+        raw = (
+            "MIME-Version: 1.0\n"
+            'Content-Type: multipart/mixed; boundary="B"\n\n'
+            "--B\n"
+            "Content-Type: text/html; charset=utf-8\n\n"
+            f"{html}\n"
+            "--B\n"
+            f"{image_headers.strip()}\n\n"
+            "fake\n"
+            "--B\n"
+            "Content-Type: text/plain\n"
+            'Content-Disposition: attachment; filename="note.txt"\n\n'
+            "content\n"
+            "--B--\n"
+        )
+        return raw.encode("utf-8")
+
+    def test_an_inline_part_is_not_announced_as_a_file(self):
+        sent, inline = mail_message.classify_parts(
+            self._message(
+                "Content-Type: image/png\n"
+                "Content-Id: <LOGO-1>\n"
+                'Content-Disposition: inline; filename="logo.png"'
+            )
+        )
+        self.assertEqual(sent, ["note.txt"])
+        self.assertEqual(inline, ["logo.png"])
+
+    def test_a_part_the_body_displays_belongs_to_the_body(self):
+        # No disposition at all: what settles it is the HTML showing it.
+        sent, inline = mail_message.classify_parts(
+            self._message(
+                'Content-Type: image/png; name="logo.png"\nContent-Id: <LOGO-1>',
+                '<img src="cid:LOGO-1">',
+            )
+        )
+        self.assertEqual(inline, ["logo.png"])
+        self.assertEqual(sent, ["note.txt"])
+
+    def test_a_message_the_server_built_classifies_the_same_way(self):
+        signature = mail_signature.Signature(
+            identifier="S", name="KDS", html='<img src="cid:LOGO-1">',
+            images=[mail_signature.InlineImage("LOGO-1", "image", "png", "logo.png", b"x")],
+        )
+        with tempfile.TemporaryDirectory() as workspace:
+            path = os.path.join(workspace, "note.txt")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("x")
+            built = mail_message.build_message(
+                to=["a@b.fr"], subject="S", body="Bonjour,",
+                attachment_paths=[path], signature=signature,
+            )
+        sent, inline = mail_message.classify_parts(built.as_bytes())
+        self.assertEqual(sent, ["note.txt"])
+        self.assertEqual(inline, ["logo.png"])
+
+
+class SignatureReadingTests(unittest.TestCase):
+    def test_apple_object_becomes_an_image(self):
+        # Apple writes its inline images with a tag only Mail can render.
+        rewritten = mail_signature._rewrite_apple_objects(
+            '<SPAN><OBJECT height=50 width=64 '
+            'type=application/x-apple-msg-attachment data="cid:LOGO-1"></OBJECT></SPAN>'
+        )
+        self.assertIn('<img src="cid:LOGO-1"', rewritten)
+        self.assertIn('width="64"', rewritten)
+        self.assertNotIn("<OBJECT", rewritten.upper())
+
+    def test_string_attachment_class_is_removed(self):
+        # Left in place, Mail deletes the element when the draft is opened.
+        html = mail_signature._drop_string_attachment_class(
+            '<span class="Apple-string-attachment" style="font-size: 13px;">Jean-Luc</span>'
+            "<SPAN class=Apple-string-attachment><img src=\"cid:LOGO-1\"></SPAN>"
+        )
+        self.assertNotIn("apple-string-attachment", html.lower())
+        self.assertIn('<span style="font-size: 13px;">Jean-Luc</span>', html)
+        self.assertIn('<SPAN><img src="cid:LOGO-1"></SPAN>', html)
+
+    def test_an_object_that_is_not_an_image_is_dropped(self):
+        self.assertEqual(
+            mail_signature._rewrite_apple_objects('<object data="http://x/y"></object>'), ""
+        )
+
+
+class FolderNameTests(unittest.TestCase):
+    def test_imap_utf7_is_decoded_for_reading(self):
+        self.assertEqual(
+            mail_imap.decode_folder("[Gmail]/Messages envoy&AOk-s"),
+            "[Gmail]/Messages envoyés",
+        )
+
+    def test_a_plain_name_is_left_alone(self):
+        self.assertEqual(mail_imap.decode_folder("[Gmail]/Brouillons"), "[Gmail]/Brouillons")
+
+    def test_a_literal_ampersand_survives(self):
+        self.assertEqual(mail_imap.decode_folder("Black &- White"), "Black & White")
 
 
 if __name__ == "__main__":
