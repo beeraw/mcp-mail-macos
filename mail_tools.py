@@ -664,6 +664,7 @@ def reply_to_message(
     message_id: str,
     body: str,
     reply_all: bool = False,
+    attachments: Sequence[str] | None = None,
     send: bool = True,
     confirm: bool = False,
 ) -> dict[str, Any]:
@@ -674,6 +675,7 @@ def reply_to_message(
     Mail's own reply command — which opened a compose window and rewrote the
     body on the way.
     """
+    attachment_paths = _check_attachments(attachments)
     if send and not confirm:
         original = get_message(message_id, max_body_chars=400)
         return _confirmation_needed(
@@ -686,6 +688,7 @@ def reply_to_message(
                 + ((", " + original["cc"]) if reply_all and original["cc"] else ""),
                 "reply_all": reply_all,
                 "body": body,
+                "attachments": [os.path.basename(path) for path in attachment_paths],
             },
         )
 
@@ -695,6 +698,7 @@ def reply_to_message(
         message_id=message_id,
         body=body,
         reply_all=reply_all,
+        attachments=attachments,
         as_draft=not send,
     )
 

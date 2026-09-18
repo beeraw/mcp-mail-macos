@@ -312,7 +312,7 @@ outside Mail.
 | `send_email(to, subject, body, cc, bcc, attachments, sender, confirm)` | Compose and send |
 | `create_draft(to, subject, body, cc, bcc, attachments, sender, signature)` | Save a draft **in Mail** |
 | `send_draft(message_id, confirm)` | Send a draft Mail already holds |
-| `reply_to_message(message_id, body, reply_all, send, confirm)` | Reply, staying in the thread |
+| `reply_to_message(message_id, body, reply_all, attachments, send, confirm)` | Reply, staying in the thread, with attachments if any |
 
 **Confirmation is mandatory.** Every tool that actually sends — `send_email`,
 `send_draft_file`, `send_draft` and `reply_to_message(send=True)` — does nothing
