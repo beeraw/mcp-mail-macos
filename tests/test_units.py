@@ -252,6 +252,12 @@ class DraftFileTests(unittest.TestCase):
         self.attachment = os.path.join(self.folder, "note.txt")
         with open(self.attachment, "w", encoding="utf-8") as handle:
             handle.write("attached content")
+        # The builder asks Mail for its accounts and reads the signature from
+        # ~/Library/Mail; neither is available here, so both are answered.
+        patch = _Patch(self)
+        account = {"name": "Work", "id": "ACCOUNT-UUID", "type": "imap", "addresses": ["me@example.com"]}
+        patch(mail_draft, "accounts", lambda: [account])
+        patch(mail_signature, "signature_for_account", lambda account_id: None)
 
     def tearDown(self):
         self.workspace.cleanup()
