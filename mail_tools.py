@@ -663,7 +663,7 @@ def send_draft(message_id: str, confirm: bool = False) -> dict[str, Any]:
 def reply_to_message(
     message_id: str,
     body: str,
-    reply_all: bool = False,
+    reply_all: bool = True,
     attachments: Sequence[str] | None = None,
     send: bool = True,
     confirm: bool = False,
@@ -675,24 +675,25 @@ def reply_to_message(
     Mail's own reply command — which opened a compose window and rewrote the
     body on the way.
     """
+    import mail_draft
+
     attachment_paths = _check_attachments(attachments)
     if send and not confirm:
         original = get_message(message_id, max_body_chars=400)
+        recipients = mail_draft.reply_recipients(original, reply_all)
         return _confirmation_needed(
             "sending this reply",
             {
                 "action": "reply_to_message",
                 "replying_to": original["subject"],
                 "original_sender": original["sender"],
-                "will_go_to": original["sender"]
-                + ((", " + original["cc"]) if reply_all and original["cc"] else ""),
+                "will_go_to": ", ".join(recipients["to"]),
+                "copied_to": ", ".join(recipients["cc"]),
                 "reply_all": reply_all,
                 "body": body,
                 "attachments": [os.path.basename(path) for path in attachment_paths],
             },
         )
-
-    import mail_draft
 
     return mail_draft.reply(
         message_id=message_id,

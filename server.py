@@ -408,7 +408,7 @@ def send_draft(message_id: str, confirm: bool = False) -> dict[str, Any]:
 def reply_to_message(
     message_id: str,
     body: str,
-    reply_all: bool = False,
+    reply_all: bool = True,
     attachments: list[str] | None = None,
     send: bool = True,
     confirm: bool = False,
@@ -421,7 +421,8 @@ def reply_to_message(
     Args:
         message_id: identifier of the message being answered.
         body: the answer, inserted above the quoted original.
-        reply_all: also answer the other recipients.
+        reply_all: also answer the other recipients, on by default; set to
+            false to answer the sender alone.
         attachments: absolute paths of existing files.
         send: send straight away; set to false to leave the reply in Drafts.
         confirm: required when send is true. Without it, who the reply would go

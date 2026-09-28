@@ -72,6 +72,21 @@ class AddressParsingTests(unittest.TestCase):
         self.assertEqual(mail_tools._as_address_list("a@b.fr,,  ,c@d.fr"), ["a@b.fr", "c@d.fr"])
 
 
+    def test_header_addresses_survive_an_address_used_as_display_name(self):
+        self.assertEqual(
+            mail_draft._addresses_of(
+                "Rose <r@example.org>, alice@example.org <alice@example.org>, B <b@c.fr>",
+                "Sam <s@example.com>",
+            ),
+            ["r@example.org", "alice@example.org", "b@c.fr", "s@example.com"],
+        )
+
+    def test_header_addresses_keep_a_comma_inside_a_quoted_name(self):
+        self.assertEqual(
+            mail_draft._addresses_of('"Doe, Jane" <j@x.fr>, a@b.fr'),
+            ["j@x.fr", "a@b.fr"],
+        )
+
 class RecordParsingTests(unittest.TestCase):
     def test_splits_records_and_fields(self):
         raw = "a\x1fb\x1e" + "c\x1fd"

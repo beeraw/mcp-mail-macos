@@ -219,6 +219,22 @@ def _bracketed(message_id: str) -> str:
     return cleaned if cleaned.startswith("<") else f"<{cleaned}>"
 
 
+def _parsed_addresses(fields: list[str]) -> list[tuple[str, str]]:
+    """Each field parsed on its own, leniently when strict parsing gives up.
+
+    Since Python 3.13 the strict parser throws a whole header away when one
+    entry looks odd, and Outlook often writes an address as its own display
+    name ("a@b.fr <a@b.fr>"): a single such entry used to empty a reply-all.
+    """
+    parsed: list[tuple[str, str]] = []
+    for field in fields:
+        pairs = email.utils.getaddresses([field])
+        if not any(address for _, address in pairs):
+            pairs = email.utils.getaddresses([field], strict=False)
+        parsed.extend(pairs)
+    return parsed
+
+
 def _addresses_of(*fields: str) -> list[str]:
     """The addresses in one or more header values, in order, without repeats.
 
@@ -227,7 +243,7 @@ def _addresses_of(*fields: str) -> list[str]:
     """
     seen: set[str] = set()
     found: list[str] = []
-    for _, address in email.utils.getaddresses([field for field in fields if field]):
+    for _, address in _parsed_addresses([field for field in fields if field]):
         cleaned = address.strip()
         key = cleaned.lower()
         if cleaned and key not in seen:
@@ -281,25 +297,8 @@ def _quoted_original(original: dict[str, Any]) -> str:
     )
 
 
-def reply(
-    message_id: str,
-    body: str,
-    reply_all: bool = False,
-    attachments: Sequence[str] | None = None,
-    as_draft: bool = False,
-    signature: bool = True,
-) -> dict[str, Any]:
-    """Answers a message, staying attached to its thread.
-
-    Mail's own "reply" command used to be the only way to get In-Reply-To and
-    References right, at the price of a compose window and of Mail rewriting
-    the body. Building the message here sets those headers directly, so the
-    answer threads and still looks like every other message this server sends.
-    """
-    import mail_tools
-
-    original = mail_tools.get_message(message_id, max_body_chars=200_000)
-
+def reply_recipients(original: dict[str, Any], reply_all: bool) -> dict[str, Any]:
+    """Works out who a reply goes to, so the preview and the sent reply agree."""
     answer_to = _addresses_of(original.get("reply_to") or original.get("sender") or "")
     if not answer_to:
         raise MailError(
@@ -330,6 +329,39 @@ def reply(
             for address in _addresses_of(original.get("to", ""), original.get("cc", ""))
             if address.lower() not in mine and address.lower() not in answered
         ]
+
+    return {
+        "to": answer_to,
+        "cc": copies,
+        "account": account,
+        "from_address": from_address,
+    }
+
+
+def reply(
+    message_id: str,
+    body: str,
+    reply_all: bool = True,
+    attachments: Sequence[str] | None = None,
+    as_draft: bool = False,
+    signature: bool = True,
+) -> dict[str, Any]:
+    """Answers a message, staying attached to its thread.
+
+    Mail's own "reply" command used to be the only way to get In-Reply-To and
+    References right, at the price of a compose window and of Mail rewriting
+    the body. Building the message here sets those headers directly, so the
+    answer threads and still looks like every other message this server sends.
+    """
+    import mail_tools
+
+    original = mail_tools.get_message(message_id, max_body_chars=200_000)
+
+    recipients = reply_recipients(original, reply_all)
+    answer_to = recipients["to"]
+    copies = recipients["cc"]
+    account = recipients["account"]
+    from_address = recipients["from_address"]
 
     subject = original.get("subject") or ""
     if not _ALREADY_A_REPLY.match(subject):
