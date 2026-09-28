@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import email
 import email.policy
+import email.utils
 import json
 import os
 import re
@@ -624,7 +625,17 @@ def send_draft(message_id: str, confirm: bool = False) -> dict[str, Any]:
     outgoing = email.message_from_bytes(raw, policy=email.policy.default)
     # The envelope carries the blind recipients; the message must not name them.
     del outgoing["Bcc"]
-    mail_imap.send_message(account_name, outgoing.as_bytes(), envelope)
+    # The draft's own Message-ID must not leave with it. Gmail keeps a single
+    # message per id: the submission was merged into the draft, and deleting
+    # the draft next took the sent message along — to the Trash, or for good.
+    # The Mail draft marker goes too, or Mail files the sent copy as a draft.
+    domain = email.utils.parseaddr(sender)[1].rpartition("@")[2] or "localhost"
+    del outgoing["Message-ID"]
+    del outgoing["Date"]
+    del outgoing["X-Uniform-Type-Identifier"]
+    outgoing["Message-ID"] = email.utils.make_msgid(domain=domain)
+    outgoing["Date"] = email.utils.formatdate(localtime=True)
+    delivered = mail_imap.send_message(account_name, outgoing.as_bytes(), envelope)
 
     result: dict[str, Any] = {
         "ok": True,
@@ -641,9 +652,19 @@ def send_draft(message_id: str, confirm: bool = False) -> dict[str, Any]:
         # Worth stating: Mail lists these as attachments, they went out as part
         # of the body instead.
         result["kept_inline"] = inline_files
+    result.update(mail_imap.sent_copy_fields(delivered))
 
-    # Only once the message is gone: a failure here leaves a stray draft, which
-    # is recoverable, where the reverse would lose the message.
+    if not result["sent_copy"].get("verified"):
+        # Without a copy in Sent, the draft is the only record of what left.
+        result["draft_removed"] = False
+        result["note"] = (
+            "The draft was kept because no sent copy could be confirmed. "
+            "Do not send it again: the message has already gone out."
+        )
+        return result
+
+    # Only once the message is gone and filed: a failure here leaves a stray
+    # draft, which is recoverable, where the reverse would lose the message.
     removed = False
     removal_error: str | None = None
     try:

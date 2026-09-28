@@ -408,6 +408,7 @@ def reply(
         prepared["account"]["name"], message.as_bytes(), prepared["to"] + prepared["cc"]
     )
     result.update({"ok": True, "mode": "send", "sent": True, "server": delivered["server"]})
+    result.update(mail_imap.sent_copy_fields(delivered))
     return result
 
 
@@ -436,4 +437,5 @@ def send(
 
     result = _recap(prepared, subject)
     result.update({"ok": True, "mode": "send", "sent": True, "server": delivered["server"]})
+    result.update(mail_imap.sent_copy_fields(delivered))
     return result

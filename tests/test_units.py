@@ -760,5 +760,100 @@ class FolderNameTests(unittest.TestCase):
         self.assertEqual(mail_imap.decode_folder("Black &- White"), "Black & White")
 
 
+class _Patch:
+    """Replaces module attributes for one test, and puts them back after."""
+
+    def __init__(self, test: unittest.TestCase):
+        self.test = test
+
+    def __call__(self, module, name, value):
+        original = getattr(module, name)
+        setattr(module, name, value)
+        self.test.addCleanup(setattr, module, name, original)
+
+
+def _account(host: str) -> mail_imap.Account:
+    server = mail_imap.Server(host=host, port=465, ssl_enabled=True, user="me@example.com")
+    return mail_imap.Account(name="Work", identifier="ACCOUNT-UUID", incoming=server, outgoing=server)
+
+
+class SentCopyTests(unittest.TestCase):
+    def setUp(self):
+        self.patch = _Patch(self)
+        self.patch(mail_imap, "SENT_COPY_WAIT", 0.0)
+        self.patch(mail_imap, "SENT_COPY_POLL", 0.0)
+        self.appended = []
+        self.patch(mail_imap, "append_sent", lambda account, raw: self.appended.append(raw) or "Sent")
+
+    def test_gmail_copy_found_is_not_filed_twice(self):
+        self.patch(mail_imap, "find_in_sent", lambda account, mid: "[Gmail]/Messages envoyés")
+        copy = mail_imap.ensure_sent_copy(_account("smtp.gmail.com"), b"raw", "<a@b>")
+        self.assertEqual(copy, {"verified": True, "folder": "[Gmail]/Messages envoyés", "filed_here": False})
+        self.assertEqual(self.appended, [])
+
+    def test_gmail_copy_missing_is_filed_here(self):
+        found = iter([None, "[Gmail]/Messages envoyés"])
+        self.patch(mail_imap, "find_in_sent", lambda account, mid: next(found))
+        copy = mail_imap.ensure_sent_copy(_account("smtp.gmail.com"), b"raw", "<a@b>")
+        self.assertTrue(copy["verified"])
+        self.assertTrue(copy["filed_here"])
+        self.assertEqual(self.appended, [b"raw"])
+
+    def test_a_copy_that_cannot_be_found_is_reported(self):
+        self.patch(mail_imap, "find_in_sent", lambda account, mid: None)
+        copy = mail_imap.ensure_sent_copy(_account("mail.other.fr"), b"raw", "<a@b>")
+        self.assertFalse(copy["verified"])
+        self.assertIn("sent_copy_warning", mail_imap.sent_copy_fields({"sent_copy": copy}))
+
+
+class SendDraftTests(unittest.TestCase):
+    DRAFT = (
+        b"From: Me <me@example.com>\r\nTo: you@x.fr\r\nBcc: hidden@x.fr\r\nSubject: Hello\r\n"
+        b"Message-ID: <draft-id@example.com>\r\nDate: Mon, 28 Sep 2026 10:00:00 +0300\r\n"
+        b"X-Uniform-Type-Identifier: com.apple.mail-draft\r\n\r\nBody.\r\n"
+    )
+
+    def setUp(self):
+        self.patch = _Patch(self)
+        row = mail_tools.FIELD_SEPARATOR.join(
+            ["Hello", "Me <me@example.com>", "you@x.fr", "", "hidden@x.fr", "", "[Gmail]/Brouillons", "Work", "Body.", "<draft-id@example.com>"]
+        )
+        self.patch(mail_tools, "run_script", lambda *args, **kwargs: row)
+        self.patch(mail_imap, "fetch_draft", lambda account, mid: self.DRAFT)
+        self.sent = []
+        self.deleted = []
+        self.patch(mail_imap, "delete_draft", lambda account, mid: self.deleted.append(mid) or True)
+        self.reference = MessageReference(account="Work", mailbox="[Gmail]/Brouillons", identifier=1).encode()
+
+    def _send(self, verified: bool):
+        def send_message(account, raw, envelope):
+            self.sent.append((raw, envelope))
+            return {"account": account, "server": "smtp", "sent_copy": {"verified": verified, "folder": "Sent", "filed_here": False}}
+
+        self.patch(mail_imap, "send_message", send_message)
+        return mail_tools.send_draft(self.reference, confirm=True)
+
+    def test_the_draft_leaves_under_a_new_message_id(self):
+        self._send(verified=True)
+        raw, envelope = self.sent[0]
+        message = email.message_from_bytes(raw)
+        self.assertNotEqual(message["Message-ID"], "<draft-id@example.com>")
+        self.assertTrue(message["Message-ID"].endswith("@example.com>"))
+        self.assertIsNone(message["X-Uniform-Type-Identifier"])
+        self.assertIsNone(message["Bcc"])
+        self.assertIn("hidden@x.fr", envelope)
+
+    def test_the_draft_is_removed_once_the_copy_is_confirmed(self):
+        answer = self._send(verified=True)
+        self.assertTrue(answer["draft_removed"])
+        self.assertEqual(self.deleted, ["<draft-id@example.com>"])
+
+    def test_the_draft_is_kept_when_no_copy_is_confirmed(self):
+        answer = self._send(verified=False)
+        self.assertFalse(answer["draft_removed"])
+        self.assertEqual(self.deleted, [])
+        self.assertIn("sent_copy_warning", answer)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -23,6 +23,7 @@ an app password, not the account password.
 from __future__ import annotations
 
 import base64
+import email
 import imaplib
 import re
 import smtplib
@@ -30,7 +31,7 @@ import ssl
 import subprocess
 import time
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Any, Sequence
 
 import config
 from mail_tools import MailError, _field, _parse_records, run_script
@@ -271,20 +272,67 @@ def append_draft(account_name: str, message_bytes: bytes) -> dict[str, str]:
 
 
 def append_sent(account: Account, message_bytes: bytes) -> str | None:
-    """Files a sent message in Sent, for a server that does not do it itself.
-
-    Gmail files everything submitted through its own SMTP, so doing it here as
-    well would show the message twice. Every other server files nothing, and
-    without this the message would be sent and then be nowhere to be seen.
-    """
-    if "gmail.com" in account.outgoing.host.lower():
-        return None
+    """Files a sent message in Sent. Returns the folder, or None on failure."""
     try:
         return _append(account, message_bytes, "\\sent", r"(\Seen)")
     except MailError:
         # The message has gone out. Not being able to file a copy is worth
         # reporting, never worth turning a successful send into a failure.
         return None
+
+
+def find_in_sent(account: Account, rfc_message_id: str) -> str | None:
+    """The Sent folder, if it holds a message with this id; None otherwise."""
+    connection = _connect(account)
+    try:
+        folder = special_folder(connection, "\\sent")
+        connection.select(_quote(folder), readonly=True)
+        status, found = connection.search(None, "HEADER", "Message-ID", _quote(rfc_message_id))
+        if status == "OK" and found and found[0] and found[0].split():
+            return decode_folder(folder)
+        return None
+    finally:
+        try:
+            connection.logout()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+# Gmail files what goes through its SMTP a few seconds after the submission.
+SENT_COPY_WAIT = 20.0
+SENT_COPY_POLL = 2.0
+
+
+def ensure_sent_copy(account: Account, message_bytes: bytes, rfc_message_id: str) -> dict[str, Any]:
+    """Makes sure a message just sent can be found in Sent, and says so.
+
+    Gmail files everything submitted through its own SMTP, so the copy is
+    waited for rather than added, which would show the message twice. But
+    Gmail also drops a submission whose Message-ID it already holds — a draft
+    sent as it stands — and every other server files nothing: either way the
+    message would be sent and then be nowhere to be seen. So a copy is only
+    trusted once it has been found there, and filed here when it has not.
+    """
+    def lookup() -> str | None:
+        try:
+            return find_in_sent(account, rfc_message_id)
+        except (MailError, imaplib.IMAP4.error, OSError):
+            return None
+
+    if "gmail.com" in account.outgoing.host.lower():
+        deadline = time.monotonic() + SENT_COPY_WAIT
+        while True:
+            folder = lookup()
+            if folder:
+                return {"verified": True, "folder": folder, "filed_here": False}
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(SENT_COPY_POLL)
+
+    if append_sent(account, message_bytes) is None:
+        return {"verified": False, "folder": None, "filed_here": False}
+    folder = lookup()
+    return {"verified": folder is not None, "folder": folder, "filed_here": True}
 
 
 def fetch_message(account_name: str, rfc_message_id: str, folder: str | None = None) -> bytes:
@@ -373,7 +421,7 @@ def delete_draft(account_name: str, rfc_message_id: str) -> bool:
             pass
 
 
-def send_message(account_name: str, message_bytes: bytes, recipients: Sequence[str]) -> dict[str, str]:
+def send_message(account_name: str, message_bytes: bytes, recipients: Sequence[str]) -> dict[str, Any]:
     """Submits a message through the account's own outgoing server."""
     account = find_account(account_name)
     server = account.outgoing
@@ -416,8 +464,22 @@ def send_message(account_name: str, message_bytes: bytes, recipients: Sequence[s
         except Exception:  # noqa: BLE001
             pass
 
-    result = {"account": account.name, "server": server.host}
-    filed = append_sent(account, message_bytes)
-    if filed:
-        result["filed_in"] = filed
+    result: dict[str, Any] = {"account": account.name, "server": server.host}
+    rfc_message_id = email.message_from_bytes(message_bytes).get("Message-ID", "").strip()
+    if not rfc_message_id:
+        result["sent_copy"] = {"verified": False, "folder": None, "filed_here": False}
+        return result
+    result["sent_copy"] = ensure_sent_copy(account, message_bytes, rfc_message_id)
     return result
+
+
+def sent_copy_fields(delivered: dict[str, Any]) -> dict[str, Any]:
+    """The part of a send result that says where the sent copy is."""
+    sent_copy = delivered.get("sent_copy") or {"verified": False, "folder": None, "filed_here": False}
+    fields: dict[str, Any] = {"sent_copy": sent_copy}
+    if not sent_copy.get("verified"):
+        fields["sent_copy_warning"] = (
+            "The message was sent, but no copy of it could be found or filed in "
+            "Sent. Tell the user: the only record of it is this conversation."
+        )
+    return fields

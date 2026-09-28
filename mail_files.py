@@ -288,6 +288,7 @@ def send_draft_file(path: str, confirm: bool = False, keep_file: bool = False) -
     result["ok"] = True
     result["sent"] = True
     result["account"] = delivered["account"]
+    result.update(mail_imap.sent_copy_fields(delivered))
 
     if keep_file:
         result["filed_as"] = full
