@@ -13,6 +13,7 @@ from __future__ import annotations
 import email
 import email.policy
 import os
+import socket
 import sys
 import tempfile
 import time
@@ -258,6 +259,9 @@ class DraftFileTests(unittest.TestCase):
         account = {"name": "Work", "id": "ACCOUNT-UUID", "type": "imap", "addresses": ["me@example.com"]}
         patch(mail_draft, "accounts", lambda: [account])
         patch(mail_signature, "signature_for_account", lambda account_id: None)
+        # make_msgid() looks the host name up, which can hang for half a
+        # minute on a runner without reverse DNS.
+        patch(socket, "getfqdn", lambda name="": "example.com")
 
     def tearDown(self):
         self.workspace.cleanup()
