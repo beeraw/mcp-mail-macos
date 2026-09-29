@@ -492,6 +492,98 @@ def build(
         print(f"{missing_file} messages had no file on disk: metadata only, no body search")
 
 
+def refresh_locations(envelope: sqlite3.Connection, index: sqlite3.Connection) -> tuple[int, int]:
+    """Brings read, flagged and mailbox membership of indexed messages up to date.
+
+    build(resume=True) skips ids it already holds, so without this a message
+    read, flagged or moved after indexing keeps its old state forever. Nothing
+    here opens a message file: membership() and the messages table already
+    carry everything, and the comparison happens in memory so that only rows
+    that really changed are written.
+
+    Returns (rows whose read/flagged changed, rows added or removed because a
+    message changed mailbox).
+    """
+    # One read transaction: the three reads below must see the same snapshot,
+    # or a Mail write landing between them looks like a mass move.
+    began = not envelope.in_transaction
+    if began:
+        envelope.execute("BEGIN")
+    try:
+        mailboxes = load_mailboxes(envelope)
+        where = membership(envelope)
+        state = {
+            row["ROWID"]: (row["read"], row["flagged"])
+            for row in envelope.execute("SELECT ROWID, read, flagged FROM messages WHERE deleted = 0")
+        }
+    finally:
+        if began:
+            envelope.rollback()
+
+    known: dict[tuple[int, str], tuple[Any, Any]] = {}
+    known_names: dict[tuple[int, str], str] = {}  # location -> account name, for uuid lookup below
+    for row in index.execute("SELECT message, mailbox, account, read, flagged FROM locations"):
+        known[(row["message"], row["mailbox"])] = (row["read"], row["flagged"])
+        known_names[(row["message"], row["mailbox"])] = row["account"]
+    indexed = {row[0] for row in index.execute("SELECT id FROM messages")}
+
+    wanted: dict[tuple[int, str], tuple[Any, Any]] = {}
+    uuids: dict[tuple[int, str], str] = {}
+    for identifier, mailbox_ids in where.items():
+        if identifier not in indexed or identifier not in state:
+            continue  # not indexed yet: build() will take care of it
+        for mailbox_id in mailbox_ids:
+            if mailbox_id in mailboxes:
+                key = (identifier, mailboxes[mailbox_id][1])
+                wanted[key] = state[identifier]
+                uuids[key] = mailboxes[mailbox_id][0]
+
+    # Account names without AppleScript: every existing location row whose
+    # mailbox path belongs to exactly one account teaches that account's name.
+    # An account never seen falls back to the uuid, as build() does.
+    by_path: dict[str, set[str]] = {}
+    for uuid, path in mailboxes.values():
+        by_path.setdefault(path, set()).add(uuid)
+    names: dict[str, str] = {}
+    for (_, path), name in known_names.items():
+        if len(by_path.get(path, ())) == 1:
+            names[next(iter(by_path[path]))] = name
+
+    updates = [
+        (read, flagged, message, mailbox)
+        for (message, mailbox), (read, flagged) in wanted.items()
+        if (message, mailbox) in known and known[(message, mailbox)] != (read, flagged)
+    ]
+    inserts = [
+        (message, names.get(uuids[(message, mailbox)], uuids[(message, mailbox)]), mailbox, read, flagged)
+        for (message, mailbox), (read, flagged) in wanted.items()
+        if (message, mailbox) not in known
+    ]
+
+    # Deleting is the dangerous half: Mail mid-sync can show empty or partial
+    # mailboxes and labels. Only delete when the picture looks complete.
+    deletes = []
+    if not mailboxes or (known and not wanted):
+        print("refresh: Mail's mailbox list looks empty or incomplete, skipping stale row removal")
+    else:
+        for key in known:
+            if key in wanted or key[0] not in state:
+                continue
+            ids = where.get(key[0], set())
+            if not ids or any(mailbox_id not in mailboxes for mailbox_id in ids):
+                continue  # membership unknown or unparsable: keep what we have
+            deletes.append(key)
+
+    index.executemany("UPDATE locations SET read = ?, flagged = ? WHERE message = ? AND mailbox = ?", updates)
+    index.executemany(
+        "INSERT OR REPLACE INTO locations (message, account, mailbox, read, flagged) VALUES (?,?,?,?,?)",
+        inserts,
+    )
+    index.executemany("DELETE FROM locations WHERE message = ? AND mailbox = ?", deletes)
+    index.commit()
+    return len(updates), len(inserts) + len(deletes)
+
+
 def sync(files: dict[int, str], envelope: sqlite3.Connection, index: sqlite3.Connection) -> None:
     """Brings the index back in line: new messages in, gone ones out.
 
@@ -508,6 +600,9 @@ def sync(files: dict[int, str], envelope: sqlite3.Connection, index: sqlite3.Con
         index.execute("DELETE FROM messages_fts WHERE rowid = ?", (identifier,))
     index.commit()
     print(f"removed {len(gone)} messages that Mail no longer lists")
+
+    flags, moved = refresh_locations(envelope, index)
+    print(f"refreshed {flags} flags, {moved} mailbox changes")
 
     build(files, envelope, index, resume=True)
 

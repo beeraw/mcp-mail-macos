@@ -16,6 +16,7 @@ import json
 import os
 import random
 import socket
+import sqlite3
 import sys
 import tempfile
 import time
@@ -1114,6 +1115,128 @@ class SearchEvaluationTests(unittest.TestCase):
     def test_result_names_cannot_escape_the_results_folder(self):
         with self.assertRaises(mail_eval.EvalError):
             mail_eval.result_path("../pairs")
+
+
+class RefreshLocationsTests(unittest.TestCase):
+    """sync() must not leave read, flagged and mailbox frozen at indexing time."""
+
+    def setUp(self):
+        self.envelope = sqlite3.connect(":memory:")
+        self.envelope.row_factory = sqlite3.Row
+        self.envelope.executescript(
+            "CREATE TABLE mailboxes (url TEXT);"
+            "CREATE TABLE messages (mailbox INTEGER, read INTEGER, flagged INTEGER, deleted INTEGER);"
+            "CREATE TABLE labels (message_id INTEGER, mailbox_id INTEGER);"
+        )
+        self.envelope.executemany(
+            "INSERT INTO mailboxes (ROWID, url) VALUES (?, ?)",
+            [(1, "imap://AAAA-1111/INBOX"), (2, "imap://AAAA-1111/Archive")],
+        )
+        self.index = sqlite3.connect(":memory:")
+        self.index.row_factory = sqlite3.Row
+        self.index.executescript(mail_index.SCHEMA)
+        for identifier in (10, 11):
+            self.index.execute(
+                "INSERT INTO messages (id, account, indexed_at) VALUES (?, 'Work', 0)", (identifier,)
+            )
+            self.index.execute(
+                "INSERT INTO locations VALUES (?, 'Work', 'INBOX', 0, 0)", (identifier,)
+            )
+
+    def tearDown(self):
+        self.envelope.close()
+        self.index.close()
+
+    def add_message(self, identifier, mailbox, read, flagged):
+        self.envelope.execute(
+            "INSERT INTO messages (ROWID, mailbox, read, flagged, deleted) VALUES (?,?,?,?,0)",
+            (identifier, mailbox, read, flagged),
+        )
+
+    def locations(self, identifier):
+        return {
+            row["mailbox"]: (row["read"], row["flagged"])
+            for row in self.index.execute("SELECT * FROM locations WHERE message = ?", (identifier,))
+        }
+
+    def test_read_and_flag_flips_reach_the_index(self):
+        self.add_message(10, 1, 1, 0)
+        self.add_message(11, 1, 0, 1)
+        self.assertEqual(mail_index.refresh_locations(self.envelope, self.index), (2, 0))
+        self.assertEqual(self.locations(10), {"INBOX": (1, 0)})
+        self.assertEqual(self.locations(11), {"INBOX": (0, 1)})
+
+    def test_unchanged_rows_are_not_rewritten(self):
+        self.add_message(10, 1, 0, 0)
+        self.add_message(11, 1, 1, 0)
+        before = self.index.total_changes
+        self.assertEqual(mail_index.refresh_locations(self.envelope, self.index), (1, 0))
+        self.assertEqual(self.index.total_changes - before, 1)
+        self.assertEqual(mail_index.refresh_locations(self.envelope, self.index), (0, 0))
+
+    def test_a_moved_message_swaps_its_location(self):
+        self.add_message(10, 2, 0, 0)
+        self.add_message(11, 1, 0, 0)
+        self.assertEqual(mail_index.refresh_locations(self.envelope, self.index), (0, 2))
+        self.assertEqual(self.locations(10), {"Archive": (0, 0)})
+
+    def test_a_message_in_two_mailboxes_keeps_both_rows_in_step(self):
+        self.add_message(10, 1, 1, 1)
+        self.envelope.execute("INSERT INTO labels VALUES (10, 2)")
+        self.add_message(11, 1, 0, 0)
+        mail_index.refresh_locations(self.envelope, self.index)
+        self.assertEqual(self.locations(10), {"INBOX": (1, 1), "Archive": (1, 1)})
+
+    def test_an_empty_mailbox_list_never_deletes(self):
+        self.add_message(10, 1, 0, 0)
+        self.add_message(11, 1, 0, 0)
+        self.envelope.execute("DELETE FROM mailboxes")
+        self.assertEqual(mail_index.refresh_locations(self.envelope, self.index), (0, 0))
+        self.assertEqual(self.locations(10), {"INBOX": (0, 0)})
+
+    def test_a_message_in_an_unparsable_mailbox_keeps_its_rows(self):
+        self.envelope.execute("INSERT INTO mailboxes (ROWID, url) VALUES (3, 'garbage')")
+        self.add_message(10, 3, 0, 0)
+        self.add_message(11, 1, 0, 0)
+        mail_index.refresh_locations(self.envelope, self.index)
+        self.assertEqual(self.locations(10), {"INBOX": (0, 0)})
+
+    def test_a_message_with_no_membership_keeps_its_rows(self):
+        self.add_message(11, 1, 0, 0)
+        self.envelope.execute(
+            "INSERT INTO messages (ROWID, mailbox, read, flagged, deleted) VALUES (10, NULL, 0, 0, 0)"
+        )
+        mail_index.refresh_locations(self.envelope, self.index)
+        self.assertEqual(self.locations(10), {"INBOX": (0, 0)})
+
+    def test_a_bulk_move_is_fully_applied(self):
+        for identifier in range(100, 400):
+            self.index.execute("INSERT INTO messages (id, account, indexed_at) VALUES (?, 'Work', 0)", (identifier,))
+            self.index.execute("INSERT INTO locations VALUES (?, 'Work', 'INBOX', 0, 0)", (identifier,))
+            self.add_message(identifier, 2, 0, 0)
+        self.add_message(10, 1, 0, 0)
+        self.add_message(11, 1, 0, 0)
+        self.assertEqual(mail_index.refresh_locations(self.envelope, self.index), (0, 600))
+        self.assertEqual(self.locations(100), {"Archive": (0, 0)})
+
+    def test_new_rows_use_the_account_of_their_mailbox(self):
+        self.envelope.execute("UPDATE mailboxes SET url = 'imap://BBBB-2222/Archive' WHERE ROWID = 2")
+        self.index.execute("INSERT INTO locations VALUES (11, 'Home', 'Archive', 0, 0)")
+        self.add_message(10, 1, 0, 0)
+        self.envelope.execute("INSERT INTO labels VALUES (10, 2)")
+        self.add_message(11, 1, 0, 0)
+        self.envelope.execute("INSERT INTO labels VALUES (11, 2)")
+        mail_index.refresh_locations(self.envelope, self.index)
+        row = self.index.execute("SELECT account FROM locations WHERE message = 10 AND mailbox = 'Archive'").fetchone()
+        self.assertEqual(row["account"], "Home")
+
+
+    def test_messages_not_indexed_yet_are_left_to_build(self):
+        self.add_message(10, 1, 0, 0)
+        self.add_message(11, 1, 0, 0)
+        self.add_message(12, 1, 1, 0)
+        mail_index.refresh_locations(self.envelope, self.index)
+        self.assertEqual(self.locations(12), {})
 
 
 if __name__ == "__main__":

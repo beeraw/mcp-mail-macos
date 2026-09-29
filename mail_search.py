@@ -381,6 +381,7 @@ def sync_index(timeout: int = 900) -> dict[str, Any]:
 
     removed = 0
     added = 0
+    refreshed = 0
     for line in output.splitlines():
         match = re.search(r"removed (\d+) messages", line)
         if match:
@@ -388,7 +389,10 @@ def sync_index(timeout: int = 900) -> dict[str, Any]:
         match = re.search(r"indexed (\d+) messages", line)
         if match:
             added = int(match.group(1))
-    result = {"ok": True, "added": added, "removed": removed, "log": output[-1000:]}
+        match = re.search(r"refreshed (\d+) flags", line)
+        if match:
+            refreshed = int(match.group(1))
+    result = {"ok": True, "added": added, "removed": removed, "refreshed": refreshed, "log": output[-1000:]}
     if purged:
         result["purged_drafts"] = purged
     return result
