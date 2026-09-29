@@ -255,7 +255,7 @@ in `launchd/com.mcp-mail-macos.sync.plist` before installing it.
 
 | Tool | Purpose |
 | --- | --- |
-| `search_all(query, account, mailbox, unread_only, flagged_only, since, until, limit, sort)` | Search every account, through the local index |
+| `search_all(query, account, mailbox, unread_only, flagged_only, since, until, limit, sort, snippets)` | Search every account, through the local index |
 | `get_thread(message_id, limit)` | The whole conversation a message belongs to |
 | `index_status()` | What the index holds and how old it is |
 | `sync_index()` | Bring the index up to date |
@@ -270,6 +270,14 @@ Results are ranked by relevance by default (`sort="relevance"`): weighted bm25
 with a subject match counting most, then sender, attachment names, and
 recipients/body, times a moderate recency bonus (up to +30 % for a mail received
 today, +15 % at one year old; a strong old match still beats a weak recent one).
+Each result carries a `snippet` (`snippets=false` to skip): about 200
+characters of the body around the first matched word, matched like the index
+does (case and accents ignored, `term*` prefixes and quoted phrases handled), or
+the start of the body when the word is only in the subject, sender or an
+attachment name. The index cannot store text, so it is read from the message's
+`.emlx` file; the file is located from the id alone (Mail shards its folders by
+the id's digits), with no extra index column. It is `null` when the file is
+missing or not downloaded. Quoted text of replies is not filtered out yet.
 `sort="date"` returns the newest matches first instead. The weights and the
 bonus are constants at the top of `mail_search.py`. The command-line
 `python3 mail_index.py --search QUERY` ranks the same way, `--sort date` to

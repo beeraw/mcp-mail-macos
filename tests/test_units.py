@@ -975,8 +975,8 @@ class SendDraftTests(unittest.TestCase):
         self.assertIn("sent_copy_warning", answer)
 
 
-class SearchRankingTests(unittest.TestCase):
-    """search_all ordering, on a throwaway FTS5 index of fictional messages."""
+class _FictionalIndexMixin:
+    """Throwaway FTS5 index of fictional messages; not collected by itself."""
 
     DAY = 86400
 
@@ -1015,11 +1015,19 @@ class SearchRankingTests(unittest.TestCase):
         patcher = mock.patch.object(mail_search, "INDEX_PATH", self.path)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # Ranking tests must not look into the real mail store for snippets.
+        store = mock.patch.object(mail_index, "find_store", side_effect=FileNotFoundError)
+        store.start()
+        self.addCleanup(store.stop)
         self.addCleanup(self.directory.cleanup)
 
     def ids(self, query, **kwargs):
         result = mail_search.search_all(query, max_age_minutes=10**9, **kwargs)
         return [message["mail_id"] for message in result["messages"]]
+
+
+class SearchRankingTests(_FictionalIndexMixin, unittest.TestCase):
+    """search_all ordering."""
 
     def test_a_subject_hit_outranks_a_body_only_hit(self):
         # Mail 1 is far more recent, but only mentions the word in its body.
@@ -1052,6 +1060,176 @@ class SearchRankingTests(unittest.TestCase):
         self.assertIn("interpreted_as", result)
         self.assertEqual(result["messages"], [])
         self.assertEqual(self.ids("shared/plan"), [5, 4, 6])
+
+
+class SnippetTests(unittest.TestCase):
+    FILLER = "Lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor. "
+
+    def test_a_term_in_the_middle_is_centred_within_the_length(self):
+        text = self.FILLER * 6 + "The budget review is on Friday. " + self.FILLER * 6
+        snippet = mail_index.make_snippet(text, "budget")
+        self.assertIn("budget", snippet)
+        self.assertTrue(snippet.startswith("…") or snippet.startswith("The"))
+        self.assertTrue(snippet.endswith("…"))
+        self.assertLessEqual(len(snippet), 202)
+
+    def test_a_term_at_the_start_has_no_leading_ellipsis(self):
+        snippet = mail_index.make_snippet("Budget " + self.FILLER * 6, "budget")
+        self.assertTrue(snippet.startswith("Budget"))
+        self.assertTrue(snippet.endswith("…"))
+
+    def test_matching_ignores_case_and_accents(self):
+        text = self.FILLER * 5 + "Le compte rendu de la réunion arrive. " + self.FILLER * 5
+        self.assertIn("réunion", mail_index.make_snippet(text, "REUNION"))
+        self.assertIn("réunion", mail_index.make_snippet(text, "réunion"))
+
+    def test_a_prefix_query_matches_a_longer_word(self):
+        text = self.FILLER * 5 + "Invoices are attached. " + self.FILLER * 5
+        self.assertIn("Invoices", mail_index.make_snippet(text, "invoic*"))
+
+    def test_an_exact_term_does_not_match_inside_a_longer_word(self):
+        text = "Notes on invoicing. " + self.FILLER * 5 + "The invoice is late. " + self.FILLER * 5
+        self.assertIn("invoice is late", mail_index.make_snippet(text, "invoice"))
+
+    def test_a_phrase_is_located_as_a_whole(self):
+        text = (
+            "The plan is fine. " + self.FILLER * 5 + "Please confirm the delivery date today. "
+            + self.FILLER * 5
+        )
+        first = mail_index.make_snippet(text, '"delivery date"')
+        self.assertIn("delivery date", first)
+        self.assertNotIn("The plan is fine", first)
+
+    def test_operators_and_column_filters_are_ignored(self):
+        text = self.FILLER * 5 + "The kickoff is set. " + self.FILLER * 5
+        query = 'subject:kickoff AND NOT spam OR NEAR(alpha beta, 3)'
+        self.assertIn("kickoff", mail_index.make_snippet(text, query))
+        self.assertEqual(mail_index.query_terms("AND OR NOT"), [])
+        self.assertEqual(mail_index.query_terms("a NOT b"), [(["a"], False)])
+
+    def test_no_hit_returns_the_start_of_the_body(self):
+        snippet = mail_index.make_snippet(self.FILLER * 6, "absent")
+        self.assertTrue(snippet.startswith("Lorem ipsum"))
+        self.assertTrue(snippet.endswith("…"))
+
+    def test_whitespace_is_collapsed(self):
+        self.assertEqual(mail_index.make_snippet("one \n\n  two\t three", "two"), "one two three")
+
+    def test_cuts_fall_on_word_boundaries(self):
+        words = " ".join(f"word{number}" for number in range(200))
+        snippet = mail_index.make_snippet(words, "word100").strip("…")
+        for piece in snippet.split(" "):
+            self.assertRegex(piece, r"^word\d+$")
+
+    def test_an_empty_body_has_no_snippet(self):
+        self.assertIsNone(mail_index.make_snippet("  \n ", "anything"))
+
+
+class MessageFileLookupTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.store = os.path.join(self.directory.name, "V10")
+        mail_index._root_cache.clear()
+        self.addCleanup(mail_index._root_cache.clear)
+
+    def place(self, mailbox, identifier, partial=False, body="Hello there, budget news.\r\n"):
+        shard = mail_index.shard_candidates(identifier)[0]
+        folder = os.path.join(
+            self.store, "ACCOUNT-UUID", mailbox + ".mbox", "STORE-UUID", "Data", shard, "Messages"
+        )
+        os.makedirs(folder, exist_ok=True)
+        raw = ("Subject: Test\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" + body).encode()
+        path = os.path.join(folder, f"{identifier}{'.partial' if partial else ''}.emlx")
+        with open(path, "wb") as handle:
+            handle.write(str(len(raw)).encode() + b"\n" + raw + b"<plist></plist>")
+        return path
+
+    def test_the_shard_comes_from_the_id_digits(self):
+        self.assertEqual(mail_index.shard_candidates(117939), ["7/1/1"])
+        self.assertEqual(mail_index.shard_candidates(5231), ["5"])
+        self.assertEqual(mail_index.shard_candidates(42), [""])
+
+    def test_a_file_is_found_under_any_mailbox_and_nesting(self):
+        path = self.place("Inbox", 117939)
+        other = self.place("Projects/Alpha", 20481)
+        self.assertEqual(mail_index.find_message_file(self.store, 117939), path)
+        self.assertEqual(mail_index.find_message_file(self.store, 20481), other)
+
+    def test_a_partial_file_is_found(self):
+        path = self.place("Inbox", 9500, partial=True)
+        self.assertEqual(mail_index.find_message_file(self.store, 9500), path)
+
+    def test_a_missing_file_gives_none(self):
+        self.place("Inbox", 117939)
+        self.assertIsNone(mail_index.find_message_file(self.store, 555555))
+
+    def test_a_mailbox_created_later_is_found_after_the_refresh_delay(self):
+        self.place("Inbox", 117939)
+        mail_index.find_message_file(self.store, 117939)
+        late = self.place("Later", 118940)
+        self.assertIsNone(mail_index.find_message_file(self.store, 118940))
+        stamp, roots = mail_index._root_cache[self.store]
+        mail_index._root_cache[self.store] = (stamp - 120, roots)
+        self.assertEqual(mail_index.find_message_file(self.store, 118940), late)
+
+    def test_message_snippet_reads_the_file(self):
+        self.place("Inbox", 117939)
+        self.assertIn("budget", mail_index.message_snippet(self.store, 117939, "budget"))
+        self.assertIsNone(mail_index.message_snippet(self.store, 999999, "budget"))
+
+
+class SearchSnippetTests(_FictionalIndexMixin, unittest.TestCase):
+    """search_all with snippets, against a fictional store on disk."""
+
+    def setUp(self):
+        super().setUp()
+        self.store_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.store_directory.cleanup)
+        store = os.path.join(self.store_directory.name, "V10")
+        mail_index._root_cache.clear()
+        self.addCleanup(mail_index._root_cache.clear)
+        folder = os.path.join(store, "ACCOUNT", "Inbox.mbox", "STORE", "Data", "Messages")
+        os.makedirs(folder)
+        raw = b"Subject: x\r\nContent-Type: text/plain\r\n\r\nThe roadmap is discussed here.\r\n"
+        with open(os.path.join(folder, "1.emlx"), "wb") as handle:
+            handle.write(str(len(raw)).encode() + b"\n" + raw)
+        self.find_store = mock.patch.object(mail_index, "find_store", return_value=store)
+        self.find_store.start()
+        self.addCleanup(self.find_store.stop)
+
+    def test_results_carry_a_snippet_and_a_missing_file_gives_null(self):
+        result = mail_search.search_all("roadmap", max_age_minutes=10**9)
+        by_id = {message["mail_id"]: message for message in result["messages"]}
+        self.assertIn("roadmap is discussed", by_id[1]["snippet"])
+        self.assertIsNone(by_id[2]["snippet"])
+
+    def test_snippets_can_be_switched_off(self):
+        result = mail_search.search_all("roadmap", max_age_minutes=10**9, snippets=False)
+        self.assertTrue(all("snippet" not in message for message in result["messages"]))
+
+    def test_get_thread_returns_the_conversation(self):
+        connection = sqlite3.connect(self.path)
+        connection.execute("UPDATE messages SET conversation_id = 7 WHERE id IN (1, 2)")
+        connection.commit()
+        connection.close()
+        reference = MessageReference("Work", "INBOX", 1).encode()
+        result = mail_search.get_thread(reference)
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(result["messages"]), 2)
+
+    def test_an_oversized_file_gets_no_snippet(self):
+        with mock.patch.object(mail_index, "SNIPPET_MAX_FILE_BYTES", 10):
+            result = mail_search.search_all("roadmap", max_age_minutes=10**9)
+        self.assertIsNone(
+            {m["mail_id"]: m for m in result["messages"]}[1]["snippet"]
+        )
+
+    def test_a_failing_snippet_never_breaks_the_search(self):
+        with mock.patch.object(mail_index, "message_snippet", side_effect=RuntimeError("boom")):
+            result = mail_search.search_all("roadmap", max_age_minutes=10**9)
+        self.assertTrue(result["ok"])
+        self.assertIsNone(result["messages"][0]["snippet"])
 
 
 class SearchEvaluationTests(unittest.TestCase):

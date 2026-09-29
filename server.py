@@ -107,6 +107,7 @@ def search_all(
     until: str | None = None,
     limit: int = 20,
     sort: str = "relevance",
+    snippets: bool = True,
 ) -> dict[str, Any]:
     """Search every message of every account, from the local index.
 
@@ -134,6 +135,10 @@ def search_all(
         until: latest date, YYYY-MM-DD.
         limit: how many messages to return (max 200).
         sort: "relevance" (default, best match first) or "date" (newest first).
+        snippets: add to each result a "snippet" of about 200 characters around
+            the first matched word (start of the body if the word is only in
+            the subject or sender; null if the message file is unavailable).
+            Lets you judge a result without opening it; pass false to skip.
     """
     return _guard(
         mail_search.search_all,
@@ -146,6 +151,7 @@ def search_all(
         until=until,
         limit=limit,
         sort=sort,
+        snippets=snippets,
     )
 
 

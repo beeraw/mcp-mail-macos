@@ -165,6 +165,31 @@ def _pick_location(
     return sorted(locations, key=rank)[0]
 
 
+def _mail_store() -> str | None:
+    import mail_index
+
+    try:
+        return mail_index.find_store()
+    except OSError:
+        return None
+
+
+def _snippet(store: str | None, identifier: int, query: str) -> str | None:
+    """A result's snippet; None whenever it cannot be had, never an error.
+
+    Mail may have moved or purged the file since indexing, or not downloaded the
+    body yet: the result is still worth returning without it.
+    """
+    if store is None:
+        return None
+    import mail_index
+
+    try:
+        return mail_index.message_snippet(store, identifier, query)
+    except Exception:  # noqa: BLE001 - a snippet is a convenience
+        return None
+
+
 def search_all(
     query: str,
     account: str | None = None,
@@ -176,11 +201,14 @@ def search_all(
     limit: int = 20,
     max_age_minutes: float = config.get("index_max_age_minutes"),
     sort: str = "relevance",
+    snippets: bool = True,
 ) -> dict[str, Any]:
     """Searches every indexed message, across all accounts.
 
     sort="relevance" (default) orders by weighted bm25 with a moderate recency
-    bonus; sort="date" orders newest first.
+    bonus; sort="date" orders newest first. With snippets=True each result
+    carries ~200 characters of its body around the first matched word, read
+    from the .emlx on disk (the index is contentless and cannot supply them).
     """
     if sort not in SORT_MODES:
         raise MailError(
@@ -252,6 +280,7 @@ def search_all(
                 raise MailError("invalid_query", f"Unusable query: {error}") from error
 
         sizes = _mailbox_sizes(connection)
+        store = _mail_store() if snippets else None
         messages = []
         for row in rows:
             locations = connection.execute(
@@ -287,6 +316,8 @@ def search_all(
                     "rfc_message_id": row["rfc_id"] or "",
                 }
             )
+            if snippets:
+                messages[-1]["snippet"] = _snippet(store, row["id"], used_query)
 
         result: dict[str, Any] = {
             "ok": True,

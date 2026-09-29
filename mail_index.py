@@ -141,6 +141,210 @@ def scan_message_files(store: str) -> dict[int, str]:
     return files
 
 
+# --------------------------------------------------------------------------
+# Finding one message's file, and cutting a snippet out of it
+# --------------------------------------------------------------------------
+
+# Mail V10 keeps a message at
+#   <account uuid>/<mailbox path>.mbox/<store uuid>/Data/<a>/<b>/<c>/Messages/<id>.emlx
+# (or <id>.partial.emlx while the body is not downloaded), where a, b, c are the
+# thousands, ten-thousands and hundred-thousands digits of the id. A message has
+# one file in one mailbox only: a Gmail label or the "All Mail" view does not
+# duplicate it, so the mailbox recorded in the index cannot give the path. The
+# shard can, and it is tried under every mailbox root: a few dozen stat calls.
+# Measured on a 54,000 file store the formula matched every file, while a full
+# walk to find the same paths takes about a second.
+# Snippets skip files larger than this: parsing a multi-megabyte message (big
+# attachments inline) would blow the per-result time budget for a convenience.
+SNIPPET_MAX_FILE_BYTES = 4 * 1024 * 1024
+ROOT_CACHE_SECONDS = 600
+ROOT_REFRESH_MIN_SECONDS = 60
+
+_root_cache: dict[str, tuple[float, list[str]]] = {}
+
+
+def shard_candidates(identifier: int) -> list[str]:
+    """Relative Data sub-folders where the file of message `identifier` may be."""
+    digits: list[str] = []
+    rest = identifier // 1000
+    while rest:
+        digits.append(str(rest % 10))
+        rest //= 10
+    shards = ["/".join(digits[:3])]
+    if len(digits) > 3:
+        # Not seen on the stores measured so far; cheap insurance.
+        shards.append("/".join(digits))
+    return shards
+
+
+def mailbox_roots(store: str) -> list[str]:
+    """Every <mailbox>.mbox/<store uuid> directory, i.e. every place a Data folder lives."""
+    roots: list[str] = []
+    for directory, subdirectories, _ in os.walk(store, onerror=lambda error: None):
+        if "Data" in subdirectories:
+            roots.append(directory)
+        subdirectories[:] = [
+            name
+            for name in subdirectories
+            if not name.startswith(".") and name not in {"Data", "MailData", "Attachments"}
+        ]
+    return roots
+
+
+def find_message_file(store: str, identifier: int) -> str | None:
+    """Path of the .emlx for a message id, or None if it is not on disk.
+
+    The mailbox roots are cached for a few minutes; a miss re-reads them at most
+    once a minute, so a mailbox created since is found without every search for
+    a not yet downloaded message paying for a walk.
+    """
+    now = time.monotonic()
+    cached = _root_cache.get(store)
+    fresh = False
+    if cached is None or now - cached[0] > ROOT_CACHE_SECONDS:
+        cached = (now, mailbox_roots(store))
+        _root_cache[store] = cached
+        fresh = True
+    while True:
+        for root in cached[1]:
+            for shard in shard_candidates(identifier):
+                folder = os.path.join(root, "Data", shard, "Messages")
+                for suffix in (".emlx", ".partial.emlx"):
+                    path = os.path.join(folder, f"{identifier}{suffix}")
+                    if os.path.isfile(path):
+                        return path
+        if fresh or now - cached[0] < ROOT_REFRESH_MIN_SECONDS:
+            return None
+        cached = (now, mailbox_roots(store))
+        _root_cache[store] = cached
+        fresh = True
+
+
+_QUERY_TOKEN = re.compile(r'"([^"]*)"|([^\s"()]+)')
+_FTS_OPERATORS = {"AND", "OR", "NOT", "NEAR"}
+
+
+class _Fold(dict):
+    """Character table that drops accents and case, one character for one.
+
+    unicode61 folds "é" and "E" onto "e". Doing it per character keeps the
+    folded text the same length as the original, so an offset found in one is
+    valid in the other.
+    """
+
+    def __missing__(self, code: int) -> str:
+        char = chr(code)
+        folded = unicodedata.normalize("NFKD", char)[:1].lower()
+        if len(folded) != 1:
+            folded = char
+        self[code] = folded
+        return folded
+
+
+_FOLD = _Fold()
+
+
+def fold_text(text: str) -> str:
+    return text.translate(_FOLD)
+
+
+def query_terms(query: str) -> list[tuple[list[str], bool]]:
+    """Reads the searchable words out of an FTS5 query.
+
+    Returns (words, prefix) entries: a quoted phrase is one entry with several
+    words, "term*" one entry flagged as a prefix. Operators, NEAR arguments,
+    column filters ("subject:") and negated terms are left out.
+    """
+    terms: list[tuple[list[str], bool]] = []
+    negate = False
+    for match in _QUERY_TOKEN.finditer(query):
+        phrase, bare = match.group(1), match.group(2)
+        prefix = False
+        if bare is not None:
+            if bare in _FTS_OPERATORS:
+                negate = bare == "NOT"
+                continue
+            if ":" in bare:
+                bare = bare.split(":", 1)[1]
+            prefix = bare.endswith("*")
+            words = re.findall(r"\w+", fold_text(bare))
+        else:
+            words = re.findall(r"\w+", fold_text(phrase))
+        if negate:
+            negate = False
+            continue
+        if words:
+            terms.append((words, prefix))
+    return terms
+
+
+def _first_hit(folded: str, terms: list[tuple[list[str], bool]]) -> int | None:
+    best: int | None = None
+    for words, prefix in terms:
+        pattern = r"(?<!\w)" + r"\W+".join(re.escape(word) for word in words)
+        if not prefix:
+            pattern += r"(?!\w)"
+        found = re.search(pattern, folded)
+        if found and (best is None or found.start() < best):
+            best = found.start()
+    if best is None:
+        # A phrase that is not there as such: fall back on its single words.
+        for words, prefix in terms:
+            if len(words) < 2:
+                continue
+            for word in words:
+                found = re.search(r"(?<!\w)" + re.escape(word), folded)
+                if found and (best is None or found.start() < best):
+                    best = found.start()
+    return best
+
+
+def make_snippet(text: str, query: str, length: int = 200) -> str | None:
+    """About `length` characters of `text` around the first query word.
+
+    Matching ignores case and accents like the index does. Without a hit (the
+    match was in the subject, the sender or an attachment name) the start of the
+    text is returned. Cuts fall on word boundaries and are marked with "…".
+    """
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return None
+    if len(text) <= length:
+        return text
+    hit = _first_hit(fold_text(text), query_terms(query))
+    start = 0
+    if hit is not None:
+        start = max(0, hit - length // 3)
+        # Begin on the sentence the hit belongs to when it starts close enough.
+        boundary = max(text.rfind(mark, start, hit) for mark in (". ", "! ", "? "))
+        if boundary != -1:
+            start = boundary + 2
+        elif start > 0 and text[start - 1] != " ":
+            space = text.find(" ", start, hit)
+            start = space + 1 if space != -1 else start
+    end = min(len(text), start + length)
+    if end < len(text):
+        cut = text.rfind(" ", start, end + 1)
+        if cut > start:
+            end = cut
+    snippet = text[start:end].strip()
+    return ("…" if start > 0 else "") + snippet + ("…" if end < len(text) else "")
+
+
+def message_snippet(store: str, identifier: int, query: str, length: int = 200) -> str | None:
+    """Snippet for one message, or None when its file cannot be found or read."""
+    path = find_message_file(store, identifier)
+    if path is None:
+        return None
+    try:
+        if os.path.getsize(path) > SNIPPET_MAX_FILE_BYTES:
+            return None
+    except OSError:
+        return None
+    _, body = extract_text(path)
+    return make_snippet(body, query, length)
+
+
 def read_raw_message(path: str) -> bytes | None:
     """Reads the RFC822 payload out of an .emlx file (byte count, message, plist)."""
     try:
