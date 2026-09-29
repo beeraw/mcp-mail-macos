@@ -1271,6 +1271,106 @@ class SearchEvaluationTests(unittest.TestCase):
         pairs = mail_eval.generate_pairs(candidates, 5, random.Random(1))
         self.assertEqual(len(pairs), 1)
 
+    def test_own_text_drops_quotes_and_stops_at_reply_headers(self):
+        text = (
+            "Hello Jane,\nthe scaffolding delivery is planned on Monday.\n"
+            "> quoted zeppelin line\n\n"
+            "On Tue, 3 Mar 2026 at 10:00, John Roe <john@example.com> wrote:\n"
+            "> older cucumber text\nolder unquoted pineapple text\n"
+        )
+        own = mail_eval.own_text(text)
+        self.assertIn("scaffolding", own)
+        for absent in ("zeppelin", "cucumber", "pineapple"):
+            self.assertNotIn(absent, own)
+
+    def test_own_text_stops_at_other_reply_markers(self):
+        for marker in (
+            "Le mardi 3 mars 2026 à 10:00, Jane Doe a écrit :",
+            "Le mardi 3 mars 2026 à 10:00, Jane Doe <jane@example.com>\na écrit :",
+            "De : Jane Doe",
+            "From: Jane Doe",
+            "-----Original Message-----",
+            "-----Message d'origine-----",
+            "-- ",
+        ):
+            own = mail_eval.own_text(f"Kept sentence here.\n{marker}\nhidden zeppelin")
+            self.assertEqual(own, "Kept sentence here.", marker)
+
+    def test_own_text_keeps_ordinary_lines_starting_with_le_or_on(self):
+        self.assertIn("Le devis arrive demain", mail_eval.own_text("Le devis arrive demain.\nOn verra."))
+
+    def test_body_query_uses_close_distinctive_words_outside_the_subject(self):
+        text = (
+            "Bonjour, please confirm the scaffolding inspection schedule before Friday. "
+            "The invoice reference 12345 covers everything and more text follows here "
+            "so that the body is long enough to be considered by the generator."
+        )
+        for seed in range(20):
+            query = mail_eval.derive_body_query(text, "Invoice question", random.Random(seed))
+            words = query.split()
+            self.assertTrue(2 <= len(words) <= 3)
+            self.assertNotIn("invoice", words)
+            self.assertTrue(all(len(word) >= 5 and not word.isdigit() for word in words))
+            tokens = text.lower().replace(".", " ").replace(",", " ").split()
+            positions = [tokens.index(word) for word in words]
+            self.assertLessEqual(max(positions) - min(positions), mail_eval.BODY_WINDOW)
+
+    def test_body_query_rejects_common_words_and_short_or_quoted_text(self):
+        text = "alpha scaffolding inspection schedule " * 5 + "\n> quoted zeppelin wording here"
+        rare = lambda word: word != "scaffolding"  # noqa: E731
+        for seed in range(10):
+            query = mail_eval.derive_body_query(text, "", random.Random(seed), rare)
+            self.assertNotIn("scaffolding", query.split())
+            self.assertNotIn("zeppelin", query)
+        self.assertIsNone(mail_eval.derive_body_query("too short", "", random.Random(1)))
+        self.assertIsNone(mail_eval.derive_body_query("> " + "quoted words only " * 30, "", random.Random(1)))
+        self.assertIsNone(mail_eval.derive_body_query(text, "", random.Random(1), lambda word: False))
+
+    def test_body_pairs_are_tagged_seedable_and_skip_missing_files(self):
+        texts = {
+            1: "scaffolding inspection schedule confirmed " * 6,
+            2: None,
+            3: "tiny",
+            4: "plumbing radiator installation planned " * 6,
+        }
+        candidates = [(identifier, "") for identifier in texts]
+        first = mail_eval.generate_body_pairs(candidates, 5, random.Random(3), texts.get)
+        second = mail_eval.generate_body_pairs(candidates, 5, random.Random(3), texts.get)
+        self.assertEqual(first, second)
+        self.assertEqual(sorted(pair["expected"] for pair in first), [1, 4])
+        self.assertTrue(all(pair["kind"] == "body" and pair["source"] == "auto" for pair in first))
+
+    def test_subject_pairs_are_tagged_subject(self):
+        pairs = mail_eval.generate_pairs([(1, "printer maintenance")], 1, random.Random(1))
+        self.assertEqual(pairs[0]["kind"], "subject")
+
+    def test_aggregates_per_kind_treat_a_missing_kind_as_subject(self):
+        rows = [
+            {"query": "a", "expected": 1, "rank": 1},
+            {"query": "b", "expected": 2, "rank": None, "kind": "body"},
+            {"query": "c", "expected": 3, "rank": 2, "kind": "body"},
+        ]
+        by_kind = mail_eval.aggregate_by_kind(rows)
+        self.assertEqual(by_kind["subject"]["pairs"], 1)
+        self.assertEqual(by_kind["body"]["pairs"], 2)
+        self.assertEqual(by_kind["body"]["not_found"], 1)
+        self.assertEqual(by_kind["all"]["pairs"], 3)
+
+    def test_compare_works_with_an_old_result_without_kinds(self):
+        old = {"aggregate": mail_eval.aggregate([1, 2]), "pairs": [
+            {"query": "a", "expected": 1, "rank": 1}, {"query": "b", "expected": 2, "rank": 2}]}
+        rows = [
+            {"query": "a", "expected": 1, "rank": 2, "kind": "subject"},
+            {"query": "b", "expected": 2, "rank": 2, "kind": "subject"},
+            {"query": "c", "expected": 3, "rank": 1, "kind": "body"},
+        ]
+        new = {"aggregate": mail_eval.aggregate([2, 2, 1]), "by_kind": mail_eval.aggregate_by_kind(rows), "pairs": rows}
+        comparison = mail_eval.compare(old, new)
+        self.assertIn("subject", comparison["by_kind"])
+        self.assertNotIn("body", comparison["by_kind"])
+        self.assertLess(comparison["by_kind"]["subject"]["mrr"], 0)
+        self.assertIn("compared with", mail_eval.format_comparison("old", comparison))
+
     def test_merge_keeps_manual_pairs_and_replaces_auto_ones(self):
         existing = [
             {"query": "old", "expected": 1, "source": "auto"},
