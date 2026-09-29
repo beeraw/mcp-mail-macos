@@ -10,6 +10,7 @@ and reports where the expected message landed.
     python3 mail_eval.py --run                       # rank, MRR, recall
     python3 mail_eval.py --run --save-baseline before
     python3 mail_eval.py --run --compare before      # deltas, regressions
+    python3 mail_eval.py --run --inflect             # queries in another inflected form
 
 The index is only ever opened read-only, and a run never triggers a sync: a
 sync in the middle of a measurement would change the corpus under it.
@@ -33,9 +34,11 @@ import random
 import re
 import sqlite3
 import sys
+import unicodedata
 from typing import Any
 
 import config
+import mail_stem
 
 
 class EvalError(Exception):
@@ -445,7 +448,7 @@ def body_sources(path: str) -> tuple[Any, Any, Any]:
             try:
                 hits = connection.execute(
                     "SELECT count(*) FROM (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ? LIMIT ?)",
-                    (f'"{word}"', MAX_DOCUMENT_FREQUENCY + 1),
+                    (mail_stem.rewrite_query(f'"{word}"'), MAX_DOCUMENT_FREQUENCY + 1),
                 ).fetchone()[0]
             except sqlite3.Error:
                 hits = 0
@@ -455,8 +458,50 @@ def body_sources(path: str) -> tuple[Any, Any, Any]:
     return load_text, is_rare, connection.close
 
 
-def run_pairs(pairs: list[dict[str, Any]]) -> dict[str, Any]:
+# Endings swapped by inflect_word, longest first. Each maps a word to another
+# inflected form (usually) of the same lexeme; the result need not be a
+# dictionary word, only a form a French speaker could have typed.
+_INFLECTIONS = (
+    ("eaux", "eau"), ("aux", "al"), ("ees", "e"), ("ee", "e"), ("ent", "e"), ("ons", "er"), ("ez", "er"),
+    ("er", "e"), ("es", "e"), ("ie", "ies"), ("e", "es"),
+)
+_INFLECT_SKIP = frozenset({"and", "or", "not", "near"})
+
+
+def inflect_word(word: str) -> str:
+    """Rewrites one word to another inflected form, deterministically.
+
+    Plural becomes singular and the reverse, -er/-ez/-ent/-ons/-ee endings move
+    to a neighbouring form, a bare -e gains its plural -s. Words that are short,
+    hold digits or are FTS5 operators are returned unchanged. Used by --inflect
+    to show the gain of stemming: eval pairs use the message's own words, which
+    an index without stemming finds trivially.
+    """
+    lowered = word.lower()
+    if len(word) < MIN_WORD_LENGTH or not word.isalpha() or lowered in _INFLECT_SKIP:
+        return word
+    folded = "".join(
+        char for char in unicodedata.normalize("NFD", lowered) if not unicodedata.combining(char)
+    )
+    if folded.endswith(("ss", "us", "is")):
+        return word
+    if folded.endswith(("s", "x")) and len(folded) > MIN_WORD_LENGTH:
+        return folded[:-1]
+    for ending, replacement in _INFLECTIONS:
+        if folded.endswith(ending) and len(folded) - len(ending) >= 3:
+            return folded[: -len(ending)] + replacement
+    return folded + "s"
+
+
+def inflect_query(query: str) -> str:
+    """Applies inflect_word to every word of a query."""
+    return WORD_PATTERN.sub(lambda match: inflect_word(match.group(0)), query)
+
+
+def run_pairs(pairs: list[dict[str, Any]], inflect: bool = False) -> dict[str, Any]:
     """Runs every pair through search_all and ranks the expected message.
+
+    With inflect=True each query is first rewritten by inflect_query.
 
     A MailError (index missing, ...) affects every query, so it aborts the run.
     Any other failure is specific to one query and is counted as an error.
@@ -474,7 +519,7 @@ def run_pairs(pairs: list[dict[str, Any]]) -> dict[str, Any]:
         }
         try:
             answer = mail_search.search_all(
-                query=pair["query"], limit=SEARCH_LIMIT, max_age_minutes=NEVER_SYNC
+                query=inflect_query(pair["query"]) if inflect else pair["query"], limit=SEARCH_LIMIT, max_age_minutes=NEVER_SYNC
             )
         except MailError as error:
             if error.code == "invalid_query":
@@ -542,6 +587,8 @@ def main() -> int:
     parser.add_argument("--seed", type=int, help="seed for --generate, to reproduce a draw")
     parser.add_argument("--pairs", default=DEFAULT_PAIRS, help=f"pairs file (default: {DEFAULT_PAIRS})")
     parser.add_argument("--run", action="store_true", help="run every pair and report ranks")
+    parser.add_argument("--inflect", action="store_true",
+                        help="rewrite each query word to another inflected form (measures stemming)")
     parser.add_argument("--json", action="store_true", help="machine-readable output for --run")
     parser.add_argument("--save-baseline", metavar="NAME", help="store this run as eval/results/NAME.json")
     parser.add_argument("--compare", metavar="NAME", help="show deltas against a stored run")
@@ -613,7 +660,8 @@ def _main(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> int
     if not pairs:
         print(f"No pairs in {arguments.pairs}. Run --generate first.", file=sys.stderr)
         return 1
-    result = run_pairs(pairs)
+    result = run_pairs(pairs, inflect=arguments.inflect)
+    result["inflect"] = arguments.inflect
 
     comparison = None
     if arguments.compare:

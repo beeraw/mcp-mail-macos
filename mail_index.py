@@ -40,6 +40,7 @@ import urllib.parse
 from typing import Any, Iterator, NamedTuple
 
 import config
+import mail_stem
 
 MAIL_ROOT = config.get("mail_root")
 DEFAULT_DATABASE = config.get("index_path")
@@ -224,28 +225,10 @@ _QUERY_TOKEN = re.compile(r'"([^"]*)"|([^\s"()]+)')
 _FTS_OPERATORS = {"AND", "OR", "NOT", "NEAR"}
 
 
-class _Fold(dict):
-    """Character table that drops accents and case, one character for one.
-
-    unicode61 folds "é" and "E" onto "e". Doing it per character keeps the
-    folded text the same length as the original, so an offset found in one is
-    valid in the other.
-    """
-
-    def __missing__(self, code: int) -> str:
-        char = chr(code)
-        folded = unicodedata.normalize("NFKD", char)[:1].lower()
-        if len(folded) != 1:
-            folded = char
-        self[code] = folded
-        return folded
-
-
-_FOLD = _Fold()
-
-
-def fold_text(text: str) -> str:
-    return text.translate(_FOLD)
+# Folding lives with the stemmer: the snippet matcher, the indexer and the query
+# rewrite must all see words the same way.
+_FOLD = mail_stem._FOLD
+fold_text = mail_stem.fold_text
 
 
 def query_terms(query: str) -> list[tuple[list[str], bool]]:
@@ -279,24 +262,53 @@ def query_terms(query: str) -> list[tuple[list[str], bool]]:
 
 
 def _first_hit(folded: str, terms: list[tuple[list[str], bool]]) -> int | None:
-    best: int | None = None
-    for words, prefix in terms:
-        pattern = r"(?<!\w)" + r"\W+".join(re.escape(word) for word in words)
-        if not prefix:
-            pattern += r"(?!\w)"
-        found = re.search(pattern, folded)
-        if found and (best is None or found.start() < best):
-            best = found.start()
-    if best is None:
-        # A phrase that is not there as such: fall back on its single words.
-        for words, prefix in terms:
-            if len(words) < 2:
+    """Offset of the first word of `folded` that matches a query term.
+
+    The exact form is preferred: the text is first searched for the words as
+    typed (a phrase as consecutive words, a prefix term as a word start). Only
+    without a hit are words compared as stems, so "factures" in the text is
+    found for "facture" in the query, then a phrase's single words.
+    """
+    found = [(match.start(), match.group(0)) for match in mail_stem.TOKEN.finditer(folded)]
+    raw = [word for _, word in found]
+    stems = [mail_stem.stem_word(word) for word in raw]
+
+    def scan(sequence: list[str], words: list[str], prefix: bool) -> int | None:
+        size = len(words)
+        for start in range(len(sequence) - size + 1):
+            if sequence[start:start + size - 1] != words[:-1]:
                 continue
-            for word in words:
-                found = re.search(r"(?<!\w)" + re.escape(word), folded)
-                if found and (best is None or found.start() < best):
-                    best = found.start()
-    return best
+            last = sequence[start + size - 1]
+            if last == words[-1] or (prefix and last.startswith(words[-1])):
+                return found[start][0]
+        return None
+
+    def earliest(sequence: list[str], stemmed: bool, single: bool = False) -> int | None:
+        best: int | None = None
+        for words, prefix in terms:
+            if single:
+                if len(words) < 2:
+                    continue
+                groups = [([word], True) for word in words]
+            else:
+                groups = [(words, prefix)]
+            for group, group_prefix in groups:
+                wanted = [mail_stem.stem_word(word) for word in group] if stemmed else group
+                hit = scan(sequence, wanted, group_prefix)
+                if hit is not None and (best is None or hit < best):
+                    best = hit
+        return best
+
+    for sequence, stemmed in ((raw, False), (stems, True)):
+        hit = earliest(sequence, stemmed)
+        if hit is not None:
+            return hit
+    # A phrase that is not there as such: fall back on its single words.
+    for sequence, stemmed in ((raw, False), (stems, True)):
+        hit = earliest(sequence, stemmed, single=True)
+        if hit is not None:
+            return hit
+    return None
 
 
 def make_snippet(text: str, query: str, length: int = 200) -> str | None:
@@ -306,7 +318,8 @@ def make_snippet(text: str, query: str, length: int = 200) -> str | None:
     match was in the subject, the sender or an attachment name) the start of the
     text is returned. Cuts fall on word boundaries and are marked with "…".
     """
-    text = re.sub(r"\s+", " ", text).strip()
+    # Composed first: fold_text composes, and offsets must agree with the text cut.
+    text = re.sub(r"\s+", " ", unicodedata.normalize("NFC", text)).strip()
     if not text:
         return None
     if len(text) <= length:
@@ -939,9 +952,13 @@ CREATE TABLE IF NOT EXISTS locations (
 CREATE INDEX IF NOT EXISTS locations_mailbox ON locations(account, mailbox);
 
 -- Indexed but not stored: the body is searchable, never kept. A hit returns a
--- reference and the message itself is re-read from Mail on demand.
+-- reference and the message itself is re-read from Mail on demand. The first six
+-- columns hold the words as they are; the three *_stem columns hold the same
+-- text as French light stems (mail_stem.stem_text), so a word is found in its
+-- exact form and in its other inflections.
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     subject, sender, "to", cc, attachments, body,
+    subject_stem, attachments_stem, body_stem,
     content='', contentless_delete=1
 );
 
@@ -955,7 +972,9 @@ CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 #   3: To and Cc kept apart (FTS columns and a recipients table), has_attachment,
 #      list_id and is_bulk
 #   4: quoted history cut from indexed bodies (content change, same tables)
-SCHEMA_VERSION = 4
+#   5: three extra FTS columns (subject_stem, attachments_stem, body_stem) hold
+#      French light stems next to the raw text; queries search both
+SCHEMA_VERSION = 5
 
 
 class IndexSchemaError(Exception):
@@ -1228,8 +1247,9 @@ def build(
             )
         index.execute("DELETE FROM messages_fts WHERE rowid = ?", (identifier,))
         index.execute(
-            'INSERT INTO messages_fts (rowid, subject, sender, "to", cc, attachments, body)'
-            " VALUES (?,?,?,?,?,?,?)",
+            "INSERT INTO messages_fts (rowid, subject, sender, \"to\", cc, attachments, body,"
+            "                          subject_stem, attachments_stem, body_stem)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?)",
             (
                 identifier,
                 row["subject"] or "",
@@ -1238,6 +1258,9 @@ def build(
                 recipient_text(message_recipients, "cc"),
                 attachments.get(identifier, ""),
                 body,
+                mail_stem.stem_text(row["subject"] or ""),
+                mail_stem.stem_text(attachments.get(identifier, "")),
+                mail_stem.stem_text(body),
             ),
         )
 
@@ -1404,7 +1427,7 @@ def search(index: sqlite3.Connection, query: str, limit: int, sort: str = "relev
         "  FROM messages_fts f JOIN messages m ON m.id = f.rowid"
         " WHERE messages_fts MATCH ?"
         f" ORDER BY {order} LIMIT ?",
-        (query, *extra, limit),
+        (mail_stem.rewrite_query(query), *extra, limit),
     ).fetchall()
     print(f"{len(rows)} hit(s)\n")
     for row in rows:

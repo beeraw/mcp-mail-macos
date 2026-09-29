@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import config
+import mail_stem
 from mail_tools import MailError, MessageReference
 
 INDEX_PATH = config.get("index_path")
@@ -26,11 +27,14 @@ INDEX_PATH = config.get("index_path")
 BULK_MAILBOXES = ("[Gmail]/Tous les messages", "[Gmail]/All Mail", "[Gmail]/Important")
 
 
-# Ranking. The FTS5 columns are (subject, sender, to, cc, attachments, body);
-# bm25() takes one weight per column, in that order. A word in the subject says
-# what a mail is about, in the sender it says who wrote it, in an attachment name
-# it says what was sent; To/Cc and body match far more loosely.
-BM25_WEIGHTS = (10.0, 5.0, 1.0, 1.0, 3.0, 1.0)
+# Ranking. The FTS5 columns are (subject, sender, to, cc, attachments, body,
+# subject_stem, attachments_stem, body_stem); bm25() takes one weight per column,
+# in that order. A word in the subject says what a mail is about, in the sender
+# it says who wrote it, in an attachment name it says what was sent; To/Cc and
+# body match far more loosely. The stem columns count for a third to a quarter of
+# their raw twin (tuned on the eval pairs): a message holding the word as typed matches in both and ranks above
+# one holding only another inflection.
+BM25_WEIGHTS = (10.0, 5.0, 1.0, 1.0, 3.0, 1.0, 3.0, 1.0, 0.25)
 # Recency bonus, applied as a multiplier on the (negative) bm25 score:
 #   score = bm25 * (1 + RECENCY_BOOST / (1 + age_days / RECENCY_HALF_LIFE_DAYS))
 # A mail received today gets its score boosted by 30 %, one a year old by 15 %,
@@ -254,7 +258,7 @@ def search_all(
     try:
         conditions = ["messages_fts MATCH ?"]
         query = _legacy_column_filters(query)
-        parameters: list[Any] = [query]
+        parameters: list[Any] = [mail_stem.rewrite_query(query)]
         if since_ts:
             conditions.append("m.date_received >= ?")
             parameters.append(since_ts)
@@ -302,7 +306,7 @@ def search_all(
         except sqlite3.OperationalError:
             # The query was not valid FTS5 syntax; retry with the words quoted.
             used_query = _quote_terms(query)
-            parameters[0] = used_query
+            parameters[0] = mail_stem.rewrite_query(used_query)
             try:
                 rows = connection.execute(statement, (*parameters, *order_parameters, limit)).fetchall()
             except sqlite3.OperationalError as error:

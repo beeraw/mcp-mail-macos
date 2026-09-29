@@ -20,6 +20,7 @@ import sqlite3
 import sys
 import tempfile
 import time
+import unicodedata
 import unittest
 from unittest import mock
 
@@ -33,6 +34,7 @@ import mail_imap
 import mail_index
 import mail_message
 import mail_search
+import mail_stem
 import mail_signature
 import mail_tools
 from mail_tools import MailError, MessageReference
@@ -1056,7 +1058,7 @@ class SearchRankingTests(_FictionalIndexMixin, unittest.TestCase):
         self.assertNotEqual(self.ids("budget")[0], 6)
 
     def test_ranking_survives_the_quoted_terms_retry(self):
-        result = mail_search.search_all("plan 12/2025", max_age_minutes=10**9)
+        result = mail_search.search_all("plan (", max_age_minutes=10**9)
         self.assertIn("interpreted_as", result)
         self.assertEqual(result["messages"], [])
         self.assertEqual(self.ids("shared/plan"), [5, 4, 6])
@@ -1823,8 +1825,8 @@ class MetadataV3Tests(unittest.TestCase):
         self.assertEqual((plain.list_id, plain.unsubscribe), ("", False))
         self.assertEqual(mail_index.extract_message(os.path.join(directory.name, "no.emlx")).body, "")
 
-    def test_schema_is_version_four_and_refuses_older_versions(self):
-        self.assertEqual(mail_index.SCHEMA_VERSION, 4)
+    def test_schema_is_version_five_and_refuses_older_versions(self):
+        self.assertEqual(mail_index.SCHEMA_VERSION, 5)
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         path = os.path.join(directory.name, "index.sqlite")
@@ -1837,7 +1839,7 @@ class MetadataV3Tests(unittest.TestCase):
         old.close()
         with self.assertRaises(mail_index.IndexSchemaError) as caught:
             mail_index.open_index(path)
-        self.assertEqual((caught.exception.found, caught.exception.expected), (2, 4))
+        self.assertEqual((caught.exception.found, caught.exception.expected), (2, 5))
 
     def test_bm25_weights_match_the_fts_columns(self):
         index = sqlite3.connect(":memory:")
@@ -2149,6 +2151,303 @@ class QuoteCuttingTests(unittest.TestCase):
         self.assertEqual(
             mail_index.strip_quotes("Kept.\n-------- Message transféré --------\nhidden", eager=True), "Kept."
         )
+
+
+class FrenchStemmerTests(unittest.TestCase):
+    """mail_stem.stem_word: light French stemming, English left mostly alone."""
+
+    def test_stem_table(self):
+        table = {
+            # plurals and feminine
+            "facture": "factur", "factures": "factur",
+            "projet": "projet", "projets": "projet",
+            "bureau": "bureau", "bureaux": "bureau",
+            "chevaux": "cheval", "cheval": "cheval", "journaux": "journal",
+            "travaux": "travail", "travail": "travail",
+            # participles and verbs
+            "relance": "relanc", "relances": "relanc", "relancé": "relanc",
+            "relancée": "relanc", "relancer": "relanc", "relancent": "relanc",
+            "relancerait": "relanc", "relanceront": "relanc",
+            "payé": "pay", "payée": "pay", "payés": "pay", "payer": "pay",
+            "appelle": "appel", "appeler": "appel", "appel": "appel",
+            # words that must stay as they are
+            "devis": "devis", "avis": "avis", "français": "francais",
+            "française": "francais", "mois": "mois", "nous": "nous",
+            "document": "document", "documents": "document", "moment": "moment",
+            # short words, digits, identifiers
+            "les": "les", "des": "des", "est": "est", "pour": "pour",
+            "2025": "2025", "ref123": "ref123", "a1b2c3d4": "a1b2c3d4",
+            "x" * 45: "x" * 45,
+            # English
+            "invoices": "invoic", "invoice": "invoic", "address": "address",
+            "status": "status", "business": "business", "emails": "email",
+        }
+        for word, expected in table.items():
+            with self.subTest(word=word):
+                self.assertEqual(mail_stem.stem_word(word), expected)
+
+    def test_accents_and_case_do_not_matter(self):
+        self.assertEqual(mail_stem.stem_word("RELANCÉE"), mail_stem.stem_word("relancee"))
+        self.assertEqual(mail_stem.stem_word("Factures"), "factur")
+
+    def test_decomposed_accents_are_composed_first(self):
+        decomposed = unicodedata.normalize("NFD", "résumés")
+        self.assertNotEqual(decomposed, "résumés")
+        self.assertEqual(mail_stem.stem_text(decomposed), mail_stem.stem_text("résumés"))
+        self.assertEqual(mail_stem.stem_tokens(decomposed), ["resum"])
+        self.assertEqual(
+            mail_stem.rewrite_query(unicodedata.normalize("NFD", "relancé")), mail_stem.rewrite_query("relancé")
+        )
+
+    def test_rendez_vous_is_two_words(self):
+        self.assertEqual(mail_stem.stem_tokens("Rendez-vous demain"), ["rend", "vous", "demain"])
+
+    def test_text_keeps_one_token_per_word(self):
+        text = "Les factures_2025 du client: 12,50 EUR (relancées)"
+        self.assertEqual(
+            mail_stem.stem_text(text).split(),
+            ["les", "factur", "2025", "du", "client", "12", "50", "eur", "relanc"],
+        )
+        self.assertEqual(mail_stem.stem_text(""), "")
+
+    def test_stems_are_idempotent_for_the_indexed_form(self):
+        # A stem is re-tokenised by FTS5 but must not be stemmed again by anyone.
+        for word in ("factures", "relancées", "chevaux", "payer", "projets"):
+            stem = mail_stem.stem_word(word)
+            self.assertEqual(mail_stem.stem_word(stem), stem)
+
+    def test_a_stem_is_never_shorter_than_three_letters(self):
+        for word in ("idee", "annees", "pays", "eaux", "rues", "veste"):
+            self.assertGreaterEqual(len(mail_stem.stem_word(word)), 3)
+
+
+class QueryRewriteTests(unittest.TestCase):
+    """mail_stem.rewrite_query: raw OR stem, structure untouched."""
+
+    RAW = "{subject sender to cc attachments body}"
+    STEMS = "{subject_stem attachments_stem body_stem}"
+
+    def test_bare_word_is_searched_raw_or_stemmed(self):
+        self.assertEqual(
+            mail_stem.rewrite_query("factures"),
+            f'({self.RAW}: "factures" OR {self.STEMS}: "factur")',
+        )
+
+    def test_prefix_is_raw_or_stemmed_prefix(self):
+        self.assertEqual(
+            mail_stem.rewrite_query("fact*"),
+            f'({self.RAW}: "fact"* OR {self.STEMS}: "fact"*)',
+        )
+        self.assertEqual(
+            mail_stem.rewrite_query("relancer*"),
+            f'({self.RAW}: "relancer"* OR {self.STEMS}: "relanc"*)',
+        )
+
+    def test_phrase_is_exact_raw_only(self):
+        self.assertEqual(
+            mail_stem.rewrite_query('"les factures payées"'),
+            f'{self.RAW}: "les factures payees"',
+        )
+        self.assertEqual(mail_stem.rewrite_query('"a b"*'), f'{self.RAW}: "a b"*')
+
+    def test_column_filters_pick_raw_and_stem_columns(self):
+        self.assertEqual(
+            mail_stem.rewrite_query("subject:factures"),
+            '({subject}: "factures" OR {subject_stem}: "factur")',
+        )
+        self.assertEqual(mail_stem.rewrite_query("sender:jane"), '{sender}: "jane"')
+        self.assertEqual(mail_stem.rewrite_query("{to cc}: bobs").strip(), '{to cc}: "bobs"')
+        self.assertEqual(
+            mail_stem.rewrite_query('subject:"les factures"'), '{subject}: "les factures"'
+        )
+        mixed = mail_stem.rewrite_query("{subject to}: factures")
+        self.assertIn('{subject to}: "factures"', mixed)
+        self.assertIn('{subject_stem}: "factur"', mixed)
+
+    def test_unknown_column_is_read_as_a_word(self):
+        rewritten = mail_stem.rewrite_query("re: factures")
+        self.assertTrue(rewritten.startswith(f'{self.RAW}: "re" AND '))
+        self.assertNotIn("re:", rewritten)
+
+    def test_negated_filter_keeps_its_exclusion_untouched(self):
+        self.assertEqual(mail_stem.rewrite_query("-subject:facture"), "-subject:facture")
+        self.assertEqual(mail_stem.rewrite_query("-{to cc}:jane"), "-{to cc}:jane")
+        self.assertEqual(mail_stem.rewrite_query("-subject:(a b)").replace(" AND ", " "), "-subject:(a b)")
+        self.assertTrue(mail_stem.rewrite_query("plan -subject:facture").endswith("AND -subject:facture"))
+
+    def test_negated_filter_excludes_the_column_in_a_real_index(self):
+        # "-subject:facture" is FTS5 for "facture in any column but the subject".
+        connection = sqlite3.connect(":memory:")
+        connection.executescript(mail_index.SCHEMA)
+        for identifier, subject, body in ((1, "facture", "plan"), (2, "plan", "facture")):
+            connection.execute(
+                "INSERT INTO messages_fts (rowid, subject, subject_stem, body, body_stem)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (identifier, subject, mail_stem.stem_text(subject), body, mail_stem.stem_text(body)),
+            )
+        rows = connection.execute(
+            "SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?",
+            (mail_stem.rewrite_query("-subject:facture"),),
+        ).fetchall()
+        self.assertEqual([row[0] for row in rows], [2])
+
+    def test_initial_token_and_phrase_concatenation_stay_valid(self):
+        self.assertEqual(mail_stem.rewrite_query("subject:^facture"), 'subject:^"facture"')
+        self.assertEqual(mail_stem.rewrite_query("a + b"), '"a" + "b"')
+        self.assertEqual(mail_stem.rewrite_query('"x y" + z'), '"x y" + "z"')
+        connection = sqlite3.connect(":memory:")
+        connection.executescript(mail_index.SCHEMA)
+        for query in ("subject:^facture", "a + b", "a+b", "budget a + b"):
+            connection.execute("SELECT * FROM messages_fts WHERE messages_fts MATCH ?", (mail_stem.rewrite_query(query),))
+
+    def test_words_fts5_would_refuse_become_raw_phrases(self):
+        raw = "{subject sender to cc attachments body}"
+        self.assertEqual(mail_stem.rewrite_query("l'entreprise"), f'{raw}: "l entreprise"')
+        self.assertEqual(mail_stem.rewrite_query("rendez-vous"), f'{raw}: "rendez vous"')
+        self.assertEqual(mail_stem.rewrite_query("F-2025-001"), f'{raw}: "f 2025 001"')
+        self.assertEqual(mail_stem.rewrite_query("l'entrepr*"), f'{raw}: "l entrepr"*')
+        rewritten = mail_stem.rewrite_query("factures 12/2025")
+        self.assertIn('"factur"', rewritten)  # the plain word keeps its stem expansion
+        self.assertIn(f'{raw}: "12 2025"', rewritten)
+        connection = sqlite3.connect(":memory:")
+        connection.executescript(mail_index.SCHEMA)
+        for query in ("l'entreprise", "rendez-vous", "F-2025-001", "factures 12/2025", "12:30"):
+            connection.execute("SELECT * FROM messages_fts WHERE messages_fts MATCH ?", (mail_stem.rewrite_query(query),))
+
+    def test_operators_and_parentheses_pass_through(self):
+        rewritten = mail_stem.rewrite_query("(devis OR budget) NOT spam")
+        self.assertRegex(rewritten, r'^\(\(.*"devis".*\) OR \(.*"budget".*\)\) NOT \(.*"spam".*\)$')
+        self.assertEqual(mail_stem.rewrite_query("^devis"), '^"devis"')
+
+    def test_implicit_and_is_written_out_between_expanded_terms(self):
+        self.assertRegex(mail_stem.rewrite_query("factures jane"), r"\) +AND +\(")
+
+    def test_near_words_are_raw_and_distance_is_kept(self):
+        self.assertEqual(mail_stem.rewrite_query("NEAR(factures payées, 5)"), 'NEAR("factures" "payees", 5)')
+
+    def test_invalid_syntax_is_left_invalid(self):
+        for query in ("a++", "plan ++"):
+            with self.subTest(query=query):
+                connection = sqlite3.connect(":memory:")
+                connection.execute("CREATE VIRTUAL TABLE t USING fts5(body)")
+                with self.assertRaises(sqlite3.OperationalError):
+                    connection.execute("SELECT * FROM t WHERE t MATCH ?", (mail_stem.rewrite_query(query),))
+
+    def test_rewritten_queries_are_valid_fts5(self):
+        connection = sqlite3.connect(":memory:")
+        connection.executescript(mail_index.SCHEMA)
+        for query in (
+            "factures", "fact*", '"les factures"', "subject:factures", "{to cc}: jane*",
+            "factures OR (devis AND jane)", "factures NOT devis", "NEAR(factures devis, 3)",
+            '"factures payées"*', "^factures", "(factures) (devis)",
+        ):
+            with self.subTest(query=query):
+                connection.execute(
+                    "SELECT * FROM messages_fts WHERE messages_fts MATCH ?", (mail_stem.rewrite_query(query),)
+                )
+
+
+class StemmedSearchTests(_FictionalIndexMixin, unittest.TestCase):
+    """End to end: dual index, rewritten query, quoted-terms retry."""
+
+    def setUp(self):
+        super().setUp()
+        index = sqlite3.connect(self.path)
+        rows = [
+            (11, "Relance des factures impayées", "jane@example.com", "bob@example.org",
+             "Facture_2025.pdf", "Merci de payer rapidement. Rendez-vous demain."),
+            (12, "Compte rendu", "john@example.org", "", "", "La facture a été payée hier."),
+        ]
+        now = int(time.time())
+        for identifier, subject, sender, to, attachments, body in rows:
+            index.execute(
+                "INSERT INTO messages (id, account, subject, sender, date_received, indexed_at)"
+                " VALUES (?, 'Work', ?, ?, ?, ?)", (identifier, subject, sender, now, now),
+            )
+            index.execute(
+                'INSERT INTO messages_fts (rowid, subject, sender, "to", cc, attachments, body,'
+                " subject_stem, attachments_stem, body_stem)"
+                " VALUES (?, ?, ?, ?, '', ?, ?, ?, ?, ?)",
+                (identifier, subject, sender, to, attachments, body,
+                 mail_stem.stem_text(subject), mail_stem.stem_text(attachments), mail_stem.stem_text(body)),
+            )
+            index.execute(
+                "INSERT INTO locations (message, account, mailbox, read, flagged)"
+                " VALUES (?, 'Work', 'INBOX', 1, 0)", (identifier,),
+            )
+        index.commit()
+        index.close()
+
+    def test_inflected_forms_find_each_other(self):
+        self.assertEqual(set(self.ids("facture")), {11, 12})
+        self.assertEqual(set(self.ids("factures")), {11, 12})
+        self.assertEqual(set(self.ids("payer")), {11, 12})
+        self.assertEqual(self.ids("relancer"), [11])
+        self.assertEqual(self.ids("relancé"), [11])
+
+    def test_the_exact_form_ranks_first(self):
+        # Mail 11 holds "payer" in its body, mail 12 "payée": same stem.
+        self.assertEqual(self.ids("payer"), [11, 12])
+        self.assertEqual(self.ids("payée"), [12, 11])
+
+    def test_names_and_addresses_stay_exact(self):
+        self.assertIn(11, self.ids("jane"))
+        self.assertEqual(set(self.ids("sender:john")), {2, 12})
+        self.assertEqual(self.ids("to:bob"), [11])
+        self.assertEqual(self.ids("sender:factures"), [])
+
+    def test_quotes_are_exact_and_prefix_and_columns_work(self):
+        self.assertEqual(set(self.ids("fact*")), {11, 12})
+        self.assertEqual(self.ids('"rendez vous"'), [11])
+        self.assertEqual(self.ids('"factures impayées"'), [11])
+        self.assertEqual(self.ids('"facture impayées"'), [])
+        self.assertEqual(self.ids('"payer"'), [11])
+        self.assertEqual(self.ids('"impayées factures"'), [])
+        self.assertEqual(set(self.ids("subject:facture")), {11})
+        self.assertEqual(self.ids("attachments:factures"), [11])
+        self.assertEqual(self.ids("facture NOT relance"), [12])
+
+    def test_legacy_recipients_filter_and_quoted_retry_still_work(self):
+        self.assertEqual(self.ids("recipients:bob"), [11])
+        result = mail_search.search_all("factures (", max_age_minutes=10**9)
+        self.assertIn("interpreted_as", result)
+        self.assertEqual([message["mail_id"] for message in result["messages"]], [11, 12] if result["messages"] else [])
+        # Slashes, hyphens and apostrophes no longer need the retry.
+        result = mail_search.search_all("factures 2025/", max_age_minutes=10**9)
+        self.assertNotIn("interpreted_as", result)
+        self.assertEqual([message["mail_id"] for message in result["messages"]], [11])
+        self.assertEqual(self.ids("factures 2025/03"), [])
+        self.assertEqual(self.ids("rendez-vous"), [11])
+        self.assertEqual(set(self.ids("les factures 2025-")), set())
+
+
+class StemmedSnippetTests(unittest.TestCase):
+    FILLER = "Lorem ipsum dolor sit amet, consectetur adipiscing elit. "
+
+    def test_snippet_centres_on_an_inflected_word(self):
+        text = self.FILLER * 5 + "Les factures sont payees. " + self.FILLER * 5
+        snippet = mail_index.make_snippet(text, "facture")
+        self.assertIn("factures", snippet)
+        snippet = mail_index.make_snippet(self.FILLER * 5 + "Il a relancé le client. " + self.FILLER * 5, "relancer")
+        self.assertIn("relancé", snippet)
+
+    def test_phrase_and_prefix_compare_stems(self):
+        text = self.FILLER * 5 + "Merci pour les factures payées. " + self.FILLER * 5
+        self.assertIn("factures payées", mail_index.make_snippet(text, '"facture payer"'))
+        self.assertIn("factures", mail_index.make_snippet(text, "fact*"))
+
+    def test_snippet_of_a_decomposed_text_lands_on_the_word(self):
+        text = unicodedata.normalize("NFD", self.FILLER * 5 + "Le résumé est prêt. " + self.FILLER * 5)
+        self.assertIn("résumé", mail_index.make_snippet(text, "résumés"))
+
+    def test_the_exact_form_is_preferred_over_a_stem_match(self):
+        text = (self.FILLER * 5 + "Une facture est jointe. " + self.FILLER * 5
+                + "Les factures suivent. " + self.FILLER * 5)
+        self.assertIn("Les factures suivent", mail_index.make_snippet(text, "factures"))
+
+    def test_a_different_word_with_the_same_start_is_not_a_hit(self):
+        text = self.FILLER * 5 + "Le facteur passe. " + self.FILLER * 5
+        self.assertTrue(mail_index.make_snippet(text, "facture").startswith("Lorem"))
 
 
 if __name__ == "__main__":

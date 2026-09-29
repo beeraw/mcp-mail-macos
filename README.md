@@ -496,6 +496,25 @@ fewer than 20 word characters would remain, the full text is kept, and a
 forward keeps its content when the text above it is tiny. Bodies indexed before
 this need a rebuild (`python3 mail_index.py --build`).
 
+### French stemming
+
+Search understands French plurals, feminines and common verb forms: `facture`
+finds `factures`, `relancé` finds `relance` and `relancer`, `travail` finds
+`travaux`. Accents and case are ignored as before. Under the hood every text
+column (subject, attachment names, body) is indexed twice, as written and as a
+light stem (`mail_stem.py`, pure Python, no dependency), and a query word is
+searched in both. A message holding the exact word ranks above one holding only
+another form. Things to know:
+
+- **Quotes mean exact.** `"facture"` and `"les factures"` match the words as
+  written, in that order, with no stemming.
+- `fact*` matches word starts in both forms. Sender, To and Cc are never
+  stemmed, so names and addresses stay exact.
+- Numbers, codes and words under four letters are left alone. The stemmer is
+  deliberately light: it will not join a noun and its verb (`paiement`, `payer`).
+- The stems change the index content: an index from before needs
+  `python3 mail_index.py --build` (schema version 5, about 25 % larger).
+
 ### Schema version
 
 The index carries a `schema_version` in its `meta` table (an index that
@@ -503,7 +522,8 @@ predates versioning counts as version 1). When the code expects a newer one,
 `search_all`, `sync_index` and `mail_index.py --sync` refuse with an
 `index_outdated` error and the hint to run `python3 mail_index.py --build`;
 they never mix formats. The version also moves when the indexed content changes,
-not only the tables: version 4 (quoted history cut from bodies) needs a rebuild
+not only the tables: version 5 (stemmed columns next to the raw ones) needs a
+rebuild from version 4; version 4 (quoted history cut from bodies) needed one
 from version 3; version 3 (To and Cc kept apart, `has_attachment`, `list_id`,
 `is_bulk`) needed one from version 2. `--build` always starts from scratch, writing to
 `<index>.building` and swapping the finished file in atomically, so the live
@@ -767,6 +787,7 @@ mcp-mail-macos/
 ├── mail_files.py       # .eml drafts, retention, leftover sweep
 ├── mail_search.py      # querying the index
 ├── mail_index.py       # building and updating the index
+├── mail_stem.py        # French light stemmer and query rewrite
 ├── mail_eval.py        # search relevance evaluation (pairs, MRR, recall)
 ├── test_manual.py      # manual checks against a real Mail install
 ├── tests/              # unit tests, no Mail required
