@@ -401,8 +401,11 @@ def _extract(path: str) -> tuple[str, str, bool]:
     return found.rfc_id, found.body, found.legacy_had_body
 
 
-def extract_message(path: str) -> Extracted:
-    """Everything the index takes from one .emlx: body, message id and bulk markers."""
+def extract_message(path: str, quotes: bool = True) -> Extracted:
+    """Everything the index takes from one .emlx: body, message id and bulk markers.
+
+    Quoted history is cut from the body unless `quotes` is False (measurement).
+    """
     raw = read_raw_message(path)
     if raw is None:
         return _NOTHING
@@ -436,13 +439,21 @@ def extract_message(path: str) -> Extracted:
             text = payload.decode("utf-8", errors="replace")
         (plain if content_type == "text/plain" else markup).append(text)
 
-    plain_text = "\n".join(plain)
-    legacy = plain_text if plain else strip_markup("\n".join(markup))
-    body = legacy
+    full_plain = "\n".join(plain)
+    full_markup = "\n".join(markup)
+    # Legacy body presence is judged on the uncut text: it measures coverage
+    # (did the message have a body at all), not what ends up indexed.
+    legacy = full_plain if plain else strip_markup(full_markup)
+    if quotes:
+        plain_text = strip_quotes(full_plain)
+        markup_text = strip_html_quotes(full_markup)
+    else:
+        plain_text, markup_text = full_plain, full_markup
+    body = plain_text if plain else strip_markup(markup_text)
     if plain and markup and _plain_is_unusable(plain_text):
         # The plain part says nothing; the HTML part is the message. Only swap
         # when it actually holds more, so a genuine short reply is left alone.
-        rendered = strip_markup("\n".join(markup))
+        rendered = strip_markup(markup_text)
         if len(rendered) > len(plain_text.strip()) or (
             len(plain_text.strip()) >= PLAIN_MIN_CHARS and has_body(rendered)
         ):
@@ -454,7 +465,8 @@ def extract_text(path: str) -> tuple[str, str]:
     """Returns (rfc message id, body text) for one .emlx file.
 
     The text/plain part wins when it says something. When it is empty or a
-    placeholder, the HTML part is used instead.
+    placeholder, the HTML part is used instead. Quoted history (replies, forwards
+    headers, signature) is cut first; see cut_quotes.
     """
     rfc_id, body, _ = _extract(path)
     return rfc_id, body
@@ -464,6 +476,224 @@ def strip_markup(text: str) -> str:
     text = re.sub(r"(?is)<(script|style).*?</\1>", " ", text)
     text = re.sub(r"(?s)<[^>]+>", " ", text)
     return re.sub(r"\s+", " ", html.unescape(text)).strip()
+
+
+# --------------------------------------------------------------------------
+# Quoted history
+# --------------------------------------------------------------------------
+#
+# A reply quotes the message it answers, so indexing every body verbatim makes a
+# thread's original compete with all its replies for the same words. The cutters
+# below drop the quoted history before indexing, and only on a pattern that
+# cannot be ordinary prose: better a duplicated paragraph than a lost message.
+
+# Fewer word characters than this left after cutting and the original text is
+# kept whole: a body reduced to nothing would make the message unfindable.
+QUOTE_MIN_OWN_CHARS = 20
+# A forward whose own text above the marker is shorter than this keeps its
+# forwarded content: for many forwards that content is the whole message.
+FORWARD_MIN_OWN_CHARS = 40
+# A "-- " block longer than this is not a signature; nothing is cut.
+SIGNATURE_MAX_LINES = 15
+# Longest reply header (joined over up to three wrapped lines) still trusted.
+_HEADER_MAX_CHARS = 300
+
+_REPLY_HEADER_START = re.compile(r"^\s*(le|on)\b", re.IGNORECASE)
+_REPLY_HEADER_END = re.compile(r"\b(a\s+écrit|a\s+ecrit|wrote)\s*:\s*$", re.IGNORECASE)
+# Outlook-style header block: a first line, then at least two more of these.
+_BLOCK_FIRST = re.compile(r"^\s*[*_]*(de|from|von|da)\s*:", re.IGNORECASE)
+_BLOCK_NEXT = re.compile(
+    r"^\s*[*_]*(envoy[ée]|sent|date|à|a|to|cc|objet|subject|betreff|importance)\s*:", re.IGNORECASE
+)
+_BLOCK_LOOKAHEAD = 8
+_REPLY_MARKER = re.compile(
+    r"^\s*-{2,}\s*(original message|message d.origine)\s*-{2,}\s*$", re.IGNORECASE
+)
+_FORWARD_MARKER = re.compile(
+    r"^\s*-{2,}\s*(forwarded message|message transf[ée]r[ée])\s*-{2,}\s*$|"
+    r"^\s*(begin forwarded message|début du message transféré|debut du message transfere)\s*:?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _word_chars(text: str) -> int:
+    return len(re.findall(r"\w", text))
+
+
+def _reply_header_length(lines: list[str], position: int) -> int:
+    """Line count of an 'On ... wrote:' / 'Le ... a écrit :' header here (up to 3), else 0."""
+    if not _REPLY_HEADER_START.match(lines[position]):
+        return 0
+    joined = ""
+    for offset in range(3):
+        if position + offset >= len(lines):
+            break
+        joined = f"{joined} {lines[position + offset].strip()}".strip()
+        if len(joined) > _HEADER_MAX_CHARS:
+            return 0
+        if _REPLY_HEADER_END.search(joined):
+            return offset + 1
+    return 0
+
+
+def _quote_follows(lines: list[str], position: int) -> bool:
+    """Whether the next non-blank line at or after `position` is a '>' line."""
+    for line in lines[position:]:
+        if line.strip():
+            return line.lstrip().startswith(">")
+    return False
+
+
+def _is_header_block(lines: list[str], position: int, eager: bool) -> bool:
+    """'De : ... Envoyé : ... Objet : ...' — needs two more header lines after the first."""
+    if not _BLOCK_FIRST.match(lines[position]):
+        return False
+    if eager:
+        return True
+    found = 0
+    for line in lines[position + 1 : position + 1 + _BLOCK_LOOKAHEAD]:
+        if not line.strip():
+            continue
+        if not _BLOCK_NEXT.match(line):
+            break
+        found += 1
+    return found >= 2
+
+
+def cut_quotes(text: str, eager: bool = False) -> tuple[str, str]:
+    """Plain text without its quoted history, plus what happened.
+
+    The status is 'none' (nothing recognised), 'cut', 'fallback' (cutting would
+    have left almost nothing, original returned) or 'forward' (a forward whose
+    own text is short: original returned). `eager` is for callers that prefer
+    losing words to keeping quoted ones (the eval): it also cuts at a lone
+    'De :' line and at forwards, accepts a bare '--', and has no fallback.
+    """
+    text = text or ""
+    lines = text.splitlines()
+    signature_at = max(
+        (i for i, line in enumerate(lines) if line == "-- " or (eager and line.rstrip() == "--")),
+        default=-1,
+    )
+    kept: list[str] = []
+    changed = False
+    skip_until = 0
+    for position, line in enumerate(lines):
+        if position < skip_until:
+            continue
+        if line.lstrip().startswith(">"):
+            changed = True
+            continue
+        if position == signature_at:
+            trailing = [rest for rest in lines[position + 1 :] if rest.strip()]
+            if len(trailing) <= SIGNATURE_MAX_LINES:
+                changed = True
+                break
+        elif _FORWARD_MARKER.match(line):
+            if not eager and _word_chars("\n".join(kept)) < FORWARD_MIN_OWN_CHARS:
+                return text, "forward"
+            changed = True
+            break
+        elif _REPLY_MARKER.match(line) or _is_header_block(lines, position, eager):
+            changed = True
+            break
+        else:
+            header = _reply_header_length(lines, position)
+            if header and eager:
+                changed = True
+                break
+            # Outside eager mode the header only counts when a quote block
+            # follows; it is dropped with that block, and whatever comes after
+            # (bottom-posted or interleaved answers) stays. Prose that merely
+            # ends like a header is kept.
+            if header and _quote_follows(lines, position + header):
+                changed = True
+                skip_until = position + header
+                continue
+        kept.append(line)
+    if not changed:
+        return text, "none"
+    own = "\n".join(kept).strip()
+    if not eager and _word_chars(own) < QUOTE_MIN_OWN_CHARS:
+        return text, "fallback"
+    return own, "cut"
+
+
+def strip_quotes(text: str, eager: bool = False) -> str:
+    """The part of a plain-text message its sender wrote; see cut_quotes."""
+    return cut_quotes(text, eager)[0]
+
+
+_TAG = re.compile(r"<(/?)([a-zA-Z][\w:-]*)([^>]*)>")
+_QUOTE_TAGS = frozenset({"div", "blockquote"})
+_CLASS_QUOTE = re.compile(r"""class\s*=\s*["'][^"']*\b(gmail_quote|yahoo_quoted|moz-cite-prefix)\b""", re.I)
+_BLOCKQUOTE_CITE = re.compile(r"""type\s*=\s*["']?cite\b""", re.I)
+_OUTLOOK_ID = re.compile(r"""id\s*=\s*["']?(divRplyFwdMsg|appendonsend)\b""", re.I)
+_BORDER_TOP = re.compile(r"""style\s*=\s*["'][^"']*border-top\s*:\s*solid""", re.I)
+_HEADER_WORDS = re.compile(r"(from|de|sent|envoy[ée]|von|da)\s*:", re.I)
+_HEADER_PEEK = 800
+
+
+def cut_html_quotes(markup: str) -> tuple[str, bool]:
+    """HTML without quoted history, and whether anything was removed.
+
+    Removes whole blockquote type=cite and Gmail quote containers; truncates at
+    Outlook's reply header (its quoted history is a sibling, not a child). Only
+    those exact markers count, so an ordinary blockquote or div is left alone.
+    """
+    out: list[str] = []
+    cursor = 0
+    changed = False
+    tokens = _TAG.finditer(markup)
+    for token in tokens:
+        closing, name, attributes = token.group(1), token.group(2).lower(), token.group(3)
+        if closing or name not in _QUOTE_TAGS:
+            continue
+        if token.start() < cursor:
+            continue
+        truncate = False
+        if name == "blockquote" and _BLOCKQUOTE_CITE.search(attributes):
+            pass
+        elif name == "div" and _CLASS_QUOTE.search(attributes):
+            pass
+        elif name == "div" and _OUTLOOK_ID.search(attributes):
+            truncate = True
+        elif name == "div" and _BORDER_TOP.search(attributes):
+            peek = strip_markup(markup[token.end() : token.end() + _HEADER_PEEK * 3])[:_HEADER_PEEK]
+            if not _HEADER_WORDS.search(peek[:200]):
+                continue
+            truncate = True
+        else:
+            continue
+        changed = True
+        if truncate:
+            out.append(markup[cursor : token.start()])
+            cursor = len(markup)
+            break
+        # Remove the balanced element (same tag name, nesting counted).
+        depth = 1
+        end = len(markup)
+        for inner in _TAG.finditer(markup, token.end()):
+            if inner.group(2).lower() != name:
+                continue
+            depth += -1 if inner.group(1) else 1
+            if depth == 0:
+                end = inner.end()
+                break
+        out.append(markup[cursor : token.start()])
+        cursor = end
+    if not changed:
+        return markup, False
+    out.append(markup[cursor:])
+    return "".join(out), True
+
+
+def strip_html_quotes(markup: str) -> str:
+    """HTML without quoted history, or the original when too little would remain."""
+    cut, changed = cut_html_quotes(markup)
+    if changed and _word_chars(strip_markup(cut)) < QUOTE_MIN_OWN_CHARS:
+        return markup
+    return cut
 
 
 # --------------------------------------------------------------------------
@@ -724,7 +954,8 @@ CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 #   2: messages.body_indexed, HTML fallback for empty text/plain parts
 #   3: To and Cc kept apart (FTS columns and a recipients table), has_attachment,
 #      list_id and is_bulk
-SCHEMA_VERSION = 3
+#   4: quoted history cut from indexed bodies (content change, same tables)
+SCHEMA_VERSION = 4
 
 
 class IndexSchemaError(Exception):

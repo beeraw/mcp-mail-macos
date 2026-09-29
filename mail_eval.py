@@ -90,17 +90,6 @@ BODY_MIN_WORD_LENGTH = 5
 # A word matching more messages than this is too common to discriminate.
 MAX_DOCUMENT_FREQUENCY = 200
 
-_REPLY_HEADER = re.compile(r"^\s*(le|on)\b.*\b(a\s+écrit|a\s+ecrit|wrote)\s*:?\s*$", re.IGNORECASE)
-_HEADER_START = re.compile(r"^\s*(le|on)\b", re.IGNORECASE)
-_HEADER_END = re.compile(r"\b(a\s+écrit|a\s+ecrit|wrote)\s*:?\s*$", re.IGNORECASE)
-_BLOCK_HEADER = re.compile(r"^\s*(de|from|von|da)\s*:", re.IGNORECASE)
-_ORIGINAL_MARKER = re.compile(
-    r"^\s*-{2,}\s*(original message|message d.origine|forwarded message|message transf)|"
-    r"^\s*(début du message transféré|begin forwarded message)",
-    re.IGNORECASE,
-)
-
-
 # --------------------------------------------------------------------------
 # Queries
 # --------------------------------------------------------------------------
@@ -137,27 +126,12 @@ def derive_query(subject: str, rng: random.Random) -> str | None:
 def own_text(text: str) -> str:
     """The part of a message its sender wrote, without quoted replies.
 
-    Stops at the first reply header ("On ... wrote:", "Le ... a écrit :", a
-    From/De block, an original-message marker) or signature delimiter, and skips
-    lines starting with '>'. A header wrapped over two lines is recognised too.
-    Cutting early is deliberate: for an eval, a missed word costs nothing, a
-    word taken from a quote would expect the wrong message.
+    Uses the index's own quote cutter in its eager mode: for an eval, a missed
+    word costs nothing, a word taken from a quote would expect the wrong message.
     """
-    lines = (text or "").splitlines()
-    kept: list[str] = []
-    for position, line in enumerate(lines):
-        stripped = line.strip()
-        if stripped.startswith(">"):
-            continue
-        if line.rstrip() == "--" or line.rstrip() == "-- ":
-            break
-        if _ORIGINAL_MARKER.match(line) or _BLOCK_HEADER.match(line) or _REPLY_HEADER.match(line):
-            break
-        following = lines[position + 1].strip() if position + 1 < len(lines) else ""
-        if _HEADER_START.match(line) and _HEADER_END.search(following) and len(stripped) < 200:
-            break
-        kept.append(line)
-    return "\n".join(kept).strip()
+    import mail_index  # deferred: mail_index is only needed once bodies are read
+
+    return mail_index.strip_quotes(text, eager=True)
 
 
 def derive_body_query(

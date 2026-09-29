@@ -10,6 +10,10 @@ index.sqlite
 index.sqlite-wal
 index.sqlite-shm
 index.sqlite.sync.lock
+index.sqlite.building
+index.sqlite.building-wal
+index.sqlite.building-shm
+index.sqlite.sync.lock.stale.*
 
 # Drafts, their archive and the sent ledger hold real message content
 mails/

@@ -280,8 +280,7 @@ the start of the body when the word is only in the subject, sender or an
 attachment name. The index cannot store text, so it is read from the message's
 `.emlx` file; the file is located from the id alone (Mail shards its folders by
 the id's digits), with no extra index column. It is `null` when the file is
-missing or not downloaded. Quoted text of replies is not filtered out yet.
-`sort="date"` returns the newest matches first instead. The weights and the
+missing or not downloaded. `sort="date"` returns the newest matches first instead. The weights and the
 bonus are constants at the top of `mail_search.py`. The command-line
 `python3 mail_index.py --search QUERY` ranks the same way, `--sort date` to
 order by date.
@@ -485,14 +484,28 @@ For `multipart/alternative` messages the `text/plain` part is used, unless it
 is empty, near-empty or a "this message contains HTML" placeholder: then the
 HTML part is stripped of markup and indexed instead.
 
+Quoted history is cut from the indexed body, so a reply no longer competes with
+the messages it quotes. Only safe patterns count: lines starting with `>` (with
+the `On ... wrote:` / `Le ... a écrit :` line that introduces them, and the
+non-quoted lines after the block are kept, for bottom-posted and interleaved
+replies); Outlook `From:`/`De :` header blocks (at least three header lines) and
+`-----Original Message-----` markers, which cut what follows; the last `-- `
+signature line when the block after it is 15 lines or fewer; in HTML,
+`blockquote type=cite`, Gmail quote containers and Outlook's reply header. If
+fewer than 20 word characters would remain, the full text is kept, and a
+forward keeps its content when the text above it is tiny. Bodies indexed before
+this need a rebuild (`python3 mail_index.py --build`).
+
 ### Schema version
 
 The index carries a `schema_version` in its `meta` table (an index that
 predates versioning counts as version 1). When the code expects a newer one,
 `search_all`, `sync_index` and `mail_index.py --sync` refuse with an
 `index_outdated` error and the hint to run `python3 mail_index.py --build`;
-they never mix formats. Version 3 (To and Cc kept apart, `has_attachment`,
-`list_id`, `is_bulk`) needs a rebuild from version 2. `--build` always starts from scratch, writing to
+they never mix formats. The version also moves when the indexed content changes,
+not only the tables: version 4 (quoted history cut from bodies) needs a rebuild
+from version 3; version 3 (To and Cc kept apart, `has_attachment`, `list_id`,
+`is_bulk`) needed one from version 2. `--build` always starts from scratch, writing to
 `<index>.building` and swapping the finished file in atomically, so the live
 index keeps answering until the new one is ready and a crashed build loses
 nothing. `--sync`, `--build` and the automatic sync share one lock file

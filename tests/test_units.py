@@ -1726,7 +1726,7 @@ class SchemaVersionTests(unittest.TestCase):
 
 
 class MetadataV3Tests(unittest.TestCase):
-    """To/Cc split, List-Id, attachments and the schema v3 refusal."""
+    """To/Cc split, List-Id, attachments and the schema refusal."""
 
     def envelope(self):
         connection = sqlite3.connect(":memory:")
@@ -1823,8 +1823,8 @@ class MetadataV3Tests(unittest.TestCase):
         self.assertEqual((plain.list_id, plain.unsubscribe), ("", False))
         self.assertEqual(mail_index.extract_message(os.path.join(directory.name, "no.emlx")).body, "")
 
-    def test_schema_is_version_three_and_refuses_version_two(self):
-        self.assertEqual(mail_index.SCHEMA_VERSION, 3)
+    def test_schema_is_version_four_and_refuses_older_versions(self):
+        self.assertEqual(mail_index.SCHEMA_VERSION, 4)
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         path = os.path.join(directory.name, "index.sqlite")
@@ -1837,7 +1837,7 @@ class MetadataV3Tests(unittest.TestCase):
         old.close()
         with self.assertRaises(mail_index.IndexSchemaError) as caught:
             mail_index.open_index(path)
-        self.assertEqual((caught.exception.found, caught.exception.expected), (2, 3))
+        self.assertEqual((caught.exception.found, caught.exception.expected), (2, 4))
 
     def test_bm25_weights_match_the_fts_columns(self):
         index = sqlite3.connect(":memory:")
@@ -1998,6 +1998,157 @@ class IndexLockRaceTests(unittest.TestCase):
                 mock.patch.object(mail_index.os, "rename", side_effect=FileNotFoundError):
             with self.assertRaises(mail_index.IndexBusy):
                 lock.acquire()
+
+
+class QuoteCuttingTests(unittest.TestCase):
+    """cut_quotes / cut_html_quotes: quoted history goes, own text stays."""
+
+    OWN = "The scaffolding delivery is planned on Monday morning."
+
+    def cut(self, text):
+        return mail_index.cut_quotes(text)
+
+    def assertCutTo(self, text, expected="OWN"):
+        cut, status = self.cut(text)
+        self.assertEqual(status, "cut", text)
+        self.assertEqual(cut, self.OWN if expected == "OWN" else expected)
+
+    def test_quoted_lines_are_dropped_and_inline_answers_kept(self):
+        self.assertCutTo(f"> older zeppelin\n{self.OWN}\n> more zeppelin")
+
+    def test_english_and_french_reply_headers(self):
+        for header in (
+            "On Tue, 3 Mar 2026 at 10:00, Jane Doe <jane@example.com> wrote:",
+            "Le mar. 3 mars 2026 à 10:00, Jane Doe <jane@example.com> a écrit :",
+            "Le mar. 3 mars 2026 à 10:00, Jane Doe\n<jane@example.com> a écrit :",
+        ):
+            self.assertCutTo(f"{self.OWN}\n\n{header}\n> older zeppelin text\n> more")
+
+    def test_outlook_header_blocks(self):
+        for block in (
+            "De : Jane Doe\nEnvoyé : mardi 3 mars 2026 10:00\nÀ : John Roe\nObjet : Example",
+            "From: Jane Doe\nSent: Tuesday, March 3, 2026 10:00\nTo: John Roe\nSubject: Example",
+        ):
+            self.assertCutTo(f"{self.OWN}\n\n{block}\n\nolder zeppelin text")
+
+    def test_original_message_markers(self):
+        for marker in ("-----Original Message-----", "----- Message d'origine -----"):
+            self.assertCutTo(f"{self.OWN}\n{marker}\nolder zeppelin text")
+
+    def test_lone_from_or_de_in_prose_is_not_a_header(self):
+        text = f"{self.OWN}\nDe : ceci est une phrase ordinaire.\nFrom: the warehouse we ship on Friday."
+        self.assertEqual(self.cut(text), (text, "none"))
+
+    def test_ordinary_lines_starting_with_le_or_on_are_kept(self):
+        text = f"{self.OWN}\nLe devis arrive demain.\nOn verra."
+        self.assertEqual(self.cut(text), (text, "none"))
+
+    def test_signature_is_cut_only_when_short(self):
+        self.assertCutTo(f"{self.OWN}\n-- \nJane Doe\nExample Ltd")
+        long_block = "\n".join(f"line {n}" for n in range(20))
+        text = f"{self.OWN}\n-- \n{long_block}"
+        self.assertEqual(self.cut(text), (text, "none"))
+
+    def test_bare_dashes_are_not_a_signature_delimiter(self):
+        text = f"{self.OWN}\n--\nnot a signature separator"
+        self.assertEqual(self.cut(text), (text, "none"))
+
+    def test_forward_with_no_own_text_keeps_the_forwarded_content(self):
+        text = "FYI\n-------- Message transféré --------\nThe pallet arrives on Thursday at the depot."
+        self.assertEqual(self.cut(text), (text, "forward"))
+
+    def test_forward_with_own_text_is_cut(self):
+        for marker in ("Begin forwarded message:", "-------- Message transféré --------"):
+            self.assertCutTo(f"{self.OWN} Please handle it.\n{marker}\nolder zeppelin text".replace(
+                f"{self.OWN} Please handle it.", self.OWN))
+
+    def test_safety_fallback_keeps_the_original_when_too_little_remains(self):
+        text = "Thanks!\nOn Tue, 3 Mar 2026, Jane Doe wrote:\n> The pallet arrives on Thursday."
+        self.assertEqual(self.cut(text), (text, "fallback"))
+
+    def test_html_blockquote_cite_is_removed(self):
+        html_text = f"<p>{self.OWN}</p><blockquote type=\"cite\"><p>older zeppelin</p><blockquote type=\"cite\">deeper</blockquote></blockquote><p>Regards from Jane Doe</p>"
+        result = mail_index.strip_markup(mail_index.strip_html_quotes(html_text))
+        self.assertEqual(result, f"{self.OWN} Regards from Jane Doe")
+
+    def test_gmail_quote_container_is_removed(self):
+        html_text = f'<div>{self.OWN}</div><div class="gmail_quote"><div class="gmail_attr">On Tue, Jane Doe wrote:</div><blockquote class="gmail_quote"><div>older zeppelin</div></blockquote></div>'
+        result = mail_index.strip_markup(mail_index.strip_html_quotes(html_text))
+        self.assertEqual(result, self.OWN)
+
+    def test_outlook_reply_header_truncates_the_rest(self):
+        for opener in (
+            '<div id="divRplyFwdMsg"><b>From:</b> Jane Doe',
+            '<div id="appendonsend"></div><hr><div id="divRplyFwdMsg"><b>De :</b> Jane Doe',
+            '<div style="border:none;border-top:solid #E1E1E1 1.0pt;padding:3.0pt 0in 0in 0in"><p><b>From:</b> Jane Doe',
+        ):
+            html_text = f"<div>{self.OWN}</div>{opener}</p></div><div>older zeppelin</div>"
+            result = mail_index.strip_markup(mail_index.strip_html_quotes(html_text))
+            self.assertEqual(result, self.OWN, opener)
+
+    def test_ordinary_html_blockquote_and_borders_are_left_alone(self):
+        html_text = f'<div>{self.OWN}</div><blockquote>A famous saying here</blockquote><div style="border-top:solid 1px">Totals below</div>'
+        self.assertEqual(mail_index.cut_html_quotes(html_text), (html_text, False))
+
+    def test_html_fallback_when_nothing_else_remains(self):
+        html_text = '<p>Hi</p><blockquote type="cite"><p>The pallet arrives on Thursday at the depot.</p></blockquote>'
+        self.assertEqual(mail_index.strip_html_quotes(html_text), html_text)
+
+    def test_extract_text_cuts_quotes_from_plain_and_html_parts(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+
+        def emlx(mime):
+            raw = mime.replace("\n", "\r\n").encode()
+            path = os.path.join(directory.name, f"{len(os.listdir(directory.name))}.emlx")
+            with open(path, "wb") as handle:
+                handle.write(str(len(raw)).encode() + b"\n" + raw)
+            return path
+
+        plain = emlx(
+            "Message-ID: <q1@example.com>\nContent-Type: text/plain; charset=utf-8\n\n"
+            f"{self.OWN}\n> older zeppelin\n"
+        )
+        self.assertEqual(mail_index.extract_text(plain)[1], self.OWN)
+        html_only = emlx(
+            "Message-ID: <q2@example.com>\nContent-Type: text/html; charset=utf-8\n\n"
+            f'<p>{self.OWN}</p><blockquote type="cite">older zeppelin</blockquote>\n'
+        )
+        self.assertEqual(mail_index.extract_text(html_only)[1], self.OWN)
+        self.assertIn("zeppelin", mail_index.extract_message(html_only, quotes=False).body)
+
+    def test_bottom_posted_reply_keeps_its_answer(self):
+        text = (
+            "Hello Jane,\n\nOn Tue, 3 Mar 2026 at 10:00, Jane Doe <jane@example.com> wrote:\n"
+            f"> older zeppelin question\n\n{self.OWN}\nRegards"
+        )
+        cut, status = self.cut(text)
+        self.assertEqual(status, "cut")
+        self.assertIn("scaffolding", cut)
+        self.assertNotIn("zeppelin", cut)
+
+    def test_interleaved_answers_are_kept(self):
+        text = f"Le mar. 3 mars 2026, Jane Doe a écrit :\n> older zeppelin question\n{self.OWN}\n> second zeppelin"
+        self.assertCutTo(text)
+
+    def test_own_line_ending_like_a_header_does_not_cut_the_rest(self):
+        text = f"{self.OWN}\nLe client nous a écrit :\nthe pallet arrives on Thursday.\nRegards"
+        self.assertEqual(self.cut(text), (text, "none"))
+        wrapped = f"{self.OWN}\nOn the phone, Jane Doe\nwrote:\nthe pallet arrives on Thursday."
+        self.assertEqual(self.cut(wrapped), (wrapped, "none"))
+
+    def test_only_the_last_signature_delimiter_counts(self):
+        text = f"{self.OWN}\n-- \nsection two follows here with real words\n-- \nJane Doe"
+        cut, status = self.cut(text)
+        self.assertEqual(status, "cut")
+        self.assertIn("section two follows", cut)
+        self.assertNotIn("Jane Doe", cut)
+
+    def test_eager_mode_cuts_lone_headers_and_forwards_without_fallback(self):
+        self.assertEqual(mail_index.strip_quotes("Kept.\nDe : Jane Doe\nhidden", eager=True), "Kept.")
+        self.assertEqual(
+            mail_index.strip_quotes("Kept.\n-------- Message transféré --------\nhidden", eager=True), "Kept."
+        )
 
 
 if __name__ == "__main__":
