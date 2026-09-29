@@ -22,3 +22,7 @@ config.json
 
 # macOS
 .DS_Store
+
+# Search evaluation pairs and results hold real message subjects
+# (see eval.example.json for the format)
+eval/

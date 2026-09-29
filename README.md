@@ -479,6 +479,30 @@ The agent is only worth it if the index must stay current with no client
 running. Otherwise `search_all`'s own freshness check is enough, and the grant
 stays scoped to a single application.
 
+### Evaluating search quality
+
+`mail_eval.py` measures where search puts the message you were looking for, so a
+change to ranking or matching can be shown to help rather than just to differ.
+It opens the index read-only and never syncs during a run.
+
+```bash
+python3 mail_eval.py --generate 200 --seed 1        # pairs from random messages
+python3 mail_eval.py --run                          # rank of each expected message
+python3 mail_eval.py --run --save-baseline before   # keep the numbers
+python3 mail_eval.py --run --compare before         # deltas, and pairs that got worse
+```
+
+A pair is a query and the message it should find. `--generate` derives the query
+from two to four distinctive words of a random message's subject; the body is
+not stored in the index, so it is not used. Pairs written by hand
+(`"source": "manual"`) are kept when the automatic ones are regenerated;
+`eval.example.json` shows the format with made-up data. The report gives MRR,
+recall@1, recall@10 and the number of pairs not found in the top 50. Add `--json`
+for machine output.
+
+Pairs and results are written under `eval/`, which is gitignored: they contain
+real subjects.
+
 ---
 
 ## Message identifiers
@@ -681,6 +705,7 @@ mcp-mail-macos/
 ├── mail_files.py       # .eml drafts, retention, leftover sweep
 ├── mail_search.py      # querying the index
 ├── mail_index.py       # building and updating the index
+├── mail_eval.py        # search relevance evaluation (pairs, MRR, recall)
 ├── test_manual.py      # manual checks against a real Mail install
 ├── tests/              # unit tests, no Mail required
 ├── applescript/        # one script per operation, plus shared handlers

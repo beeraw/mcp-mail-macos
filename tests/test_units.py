@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import email
 import email.policy
+import json
 import os
+import random
 import socket
 import sys
 import tempfile
@@ -23,6 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config
 import mail_draft
+import mail_eval
 import mail_files
 import mail_imap
 import mail_index
@@ -863,6 +866,149 @@ class SendDraftTests(unittest.TestCase):
         self.assertFalse(answer["draft_removed"])
         self.assertEqual(self.deleted, [])
         self.assertIn("sent_copy_warning", answer)
+
+
+class SearchEvaluationTests(unittest.TestCase):
+    def test_reply_prefixes_stopwords_and_short_tokens_are_dropped(self):
+        words = mail_eval.usable_words("RE: TR: Fwd: The quarterly budget for 2026 and near it")
+        self.assertEqual(words, ["quarterly", "budget"])
+
+    def test_french_stopwords_and_accents(self):
+        words = mail_eval.usable_words("Réunion pour les travaux dans la cuisine")
+        self.assertEqual(words, ["réunion", "travaux", "cuisine"])
+
+    def test_duplicates_are_removed(self):
+        self.assertEqual(mail_eval.usable_words("budget Budget budget review"), ["budget", "review"])
+
+    def test_a_subject_with_too_few_words_gives_no_query(self):
+        rng = random.Random(1)
+        self.assertIsNone(mail_eval.derive_query("Re: ok merci", rng))
+        self.assertIsNone(mail_eval.derive_query("Budget", rng))
+        self.assertIsNone(mail_eval.derive_query("", rng))
+
+    def test_the_query_uses_two_to_four_subject_words_in_order(self):
+        subject = "alpha bravo charlie delta echo foxtrot"
+        for seed in range(20):
+            query = mail_eval.derive_query(subject, random.Random(seed))
+            words = query.split()
+            self.assertTrue(2 <= len(words) <= 4)
+            self.assertEqual(words, sorted(words, key=subject.split().index))
+
+    def test_generation_is_reproducible_and_skips_unusable_subjects(self):
+        candidates = [(1, "Re: ok"), (2, "printer maintenance schedule"), (3, "budget review meeting")]
+        first = mail_eval.generate_pairs(candidates, 5, random.Random(7))
+        second = mail_eval.generate_pairs(candidates, 5, random.Random(7))
+        self.assertEqual(first, second)
+        self.assertEqual(sorted(pair["expected"] for pair in first), [2, 3])
+        self.assertTrue(all(pair["source"] == "auto" for pair in first))
+
+    def test_identical_queries_are_kept_once(self):
+        candidates = [(1, "printer maintenance"), (2, "Re: printer maintenance")]
+        pairs = mail_eval.generate_pairs(candidates, 5, random.Random(1))
+        self.assertEqual(len(pairs), 1)
+
+    def test_merge_keeps_manual_pairs_and_replaces_auto_ones(self):
+        existing = [
+            {"query": "old", "expected": 1, "source": "auto"},
+            {"query": "mine", "expected": 2, "source": "manual"},
+        ]
+        generated = [{"query": "new", "expected": 3, "source": "auto"}]
+        merged = mail_eval.merge_pairs(existing, generated)
+        self.assertEqual([pair["query"] for pair in merged], ["mine", "new"])
+
+    def test_rank_of_handles_one_or_several_expected_ids(self):
+        self.assertEqual(mail_eval.rank_of(5, [9, 5, 7]), 2)
+        self.assertEqual(mail_eval.rank_of([7, 5], [9, 5, 7]), 2)
+        self.assertIsNone(mail_eval.rank_of(4, [9, 5, 7]))
+
+    def test_aggregate_metrics(self):
+        result = mail_eval.aggregate([1, 2, None, 11])
+        self.assertEqual(result["pairs"], 4)
+        self.assertEqual(result["not_found"], 1)
+        self.assertAlmostEqual(result["mrr"], (1 + 0.5 + 1 / 11) / 4, places=4)
+        self.assertEqual(result["recall_at_1"], 0.25)
+        self.assertEqual(result["recall_at_10"], 0.5)
+
+    def test_aggregate_of_nothing_is_zero(self):
+        self.assertEqual(mail_eval.aggregate([])["pairs"], 0)
+
+    def test_compare_reports_deltas_and_pairs_that_got_worse(self):
+        def result(ranks):
+            rows = [{"query": f"q{i}", "expected": i, "rank": rank} for i, rank in enumerate(ranks)]
+            return {"aggregate": mail_eval.aggregate(ranks), "pairs": rows}
+
+        comparison = mail_eval.compare(result([1, 2, 5, None]), result([1, 4, 3, None]))
+        self.assertEqual([row["query"] for row in comparison["worse"]], ["q1"])
+        self.assertEqual((comparison["worse"][0]["before"], comparison["worse"][0]["after"]), (2, 4))
+        self.assertLess(comparison["deltas"]["recall_at_10"], 1)
+        lost = mail_eval.compare(result([3]), result([None]))
+        self.assertEqual(len(lost["worse"]), 1)
+        self.assertEqual(lost["deltas"]["not_found"], 1)
+
+    def test_pairs_file_round_trip_and_read_only_open(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "sub", "pairs.json")
+            pairs = [{"query": "printer maintenance", "expected": [1, 2], "source": "manual"}]
+            mail_eval.save_pairs(path, pairs)
+            self.assertEqual(mail_eval.load_pairs(path), (pairs, 0))
+            self.assertEqual(mail_eval.load_pairs(os.path.join(directory, "missing.json")), ([], 0))
+
+            database = os.path.join(directory, "index.sqlite")
+            import sqlite3
+            connection = sqlite3.connect(database)
+            connection.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, subject TEXT)")
+            connection.execute("INSERT INTO messages VALUES (1, 'printer maintenance')")
+            connection.commit()
+            connection.close()
+            self.assertEqual(mail_eval.load_candidates(database), [(1, "printer maintenance")])
+            reader = mail_eval.open_readonly(database)
+            with self.assertRaises(sqlite3.OperationalError):
+                reader.execute("INSERT INTO messages VALUES (2, 'x')")
+            reader.close()
+
+    def test_the_example_file_is_loadable(self):
+        example = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "eval.example.json")
+        pairs, skipped = mail_eval.load_pairs(example)
+        self.assertEqual((len(pairs), skipped), (4, 0))
+
+    def test_malformed_pairs_are_skipped_and_counted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "pairs.json")
+            rows = [
+                {"query": "printer maintenance", "expected": 1},
+                {"query": "printer maintenance"},
+                {"query": "printer maintenance", "expected": []},
+                {"query": "  ", "expected": 3},
+                {"query": "printer maintenance", "expected": "abc"},
+                {"query": "printer maintenance", "expected": [4, 5]},
+                "junk",
+            ]
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({"pairs": rows}, handle)
+            good, skipped = mail_eval.load_pairs(path)
+            self.assertEqual([pair["expected"] for pair in good], [1, [4, 5]])
+            self.assertEqual(skipped, 5)
+
+    def test_a_corrupt_pairs_file_is_a_clean_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "pairs.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("{not json")
+            with self.assertRaises(mail_eval.EvalError):
+                mail_eval.load_pairs(path)
+
+    def test_errors_are_kept_apart_from_not_found(self):
+        result = mail_eval.aggregate([1, None], errors=3)
+        self.assertEqual((result["not_found"], result["errors"], result["pairs"]), (1, 3, 2))
+
+    def test_compare_shows_the_errors_delta(self):
+        before = {"aggregate": mail_eval.aggregate([1], errors=0), "pairs": []}
+        after = {"aggregate": mail_eval.aggregate([1], errors=2), "pairs": []}
+        self.assertEqual(mail_eval.compare(before, after)["deltas"]["errors"], 2)
+
+    def test_result_names_cannot_escape_the_results_folder(self):
+        with self.assertRaises(mail_eval.EvalError):
+            mail_eval.result_path("../pairs")
 
 
 if __name__ == "__main__":

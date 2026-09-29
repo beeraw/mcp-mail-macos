@@ -1,0 +1,13 @@
+{
+  "pairs": [
+    {"query": "quarterly budget review", "expected": 1001, "source": "auto"},
+    {"query": "printer maintenance", "expected": 1002, "source": "auto"},
+    {
+      "query": "welcome onboarding checklist",
+      "expected": [1003, 1004],
+      "source": "manual",
+      "note": "Either of the two copies is a correct answer."
+    },
+    {"query": "conference invitation", "expected": 1005, "source": "manual"}
+  ]
+}
