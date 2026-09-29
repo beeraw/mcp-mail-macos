@@ -358,15 +358,41 @@ def read_raw_message(path: str) -> bytes | None:
         return None
 
 
-def extract_text(path: str) -> tuple[str, str]:
-    """Returns (rfc message id, body text) for one .emlx file."""
+# A plain part shorter than this is suspect: multipart/alternative senders often
+# ship an empty one, or a one-line notice, next to the real HTML body.
+PLAIN_MIN_CHARS = 20
+PLAIN_PLACEHOLDER_MAX_CHARS = 200
+_PLAIN_PLACEHOLDER = re.compile(
+    r"(?i)(html[- ](capable|enabled|only)|contains html|does not support html|"
+    r"view (this|the) (message|email|e-mail) in (a|your) (web )?browser|"
+    r"enable html|requires? an html)"
+)
+# Fewer word characters than this and a message counts as having no body.
+BODY_MIN_WORD_CHARS = 3
+
+
+def has_body(text: str) -> bool:
+    """True when the extracted text is more than whitespace and stray punctuation."""
+    return len(re.findall(r"\w", text)) >= BODY_MIN_WORD_CHARS
+
+
+def _plain_is_unusable(plain_text: str) -> bool:
+    """Empty, near-empty or a 'your client cannot show HTML' placeholder."""
+    stripped = plain_text.strip()
+    if len(stripped) < PLAIN_MIN_CHARS:
+        return True
+    return len(stripped) < PLAIN_PLACEHOLDER_MAX_CHARS and bool(_PLAIN_PLACEHOLDER.search(stripped))
+
+
+def _extract(path: str) -> tuple[str, str, bool]:
+    """(rfc id, body text, whether the pre-fallback logic would have found a body)."""
     raw = read_raw_message(path)
     if raw is None:
-        return "", ""
+        return "", "", False
     try:
         message = email.message_from_bytes(raw, policy=email.policy.default)
     except Exception:  # noqa: BLE001 - a malformed message still has a file
-        return "", ""
+        return "", "", False
 
     rfc_id = (message.get("message-id") or "").strip().strip("<>")
     plain: list[str] = []
@@ -388,8 +414,28 @@ def extract_text(path: str) -> tuple[str, str]:
             text = payload.decode("utf-8", errors="replace")
         (plain if content_type == "text/plain" else markup).append(text)
 
-    body = "\n".join(plain) if plain else strip_markup("\n".join(markup))
-    return rfc_id, body[:BODY_LIMIT]
+    plain_text = "\n".join(plain)
+    legacy = plain_text if plain else strip_markup("\n".join(markup))
+    body = legacy
+    if plain and markup and _plain_is_unusable(plain_text):
+        # The plain part says nothing; the HTML part is the message. Only swap
+        # when it actually holds more, so a genuine short reply is left alone.
+        rendered = strip_markup("\n".join(markup))
+        if len(rendered) > len(plain_text.strip()) or (
+            len(plain_text.strip()) >= PLAIN_MIN_CHARS and has_body(rendered)
+        ):
+            body = rendered
+    return rfc_id, body[:BODY_LIMIT], has_body(legacy[:BODY_LIMIT])
+
+
+def extract_text(path: str) -> tuple[str, str]:
+    """Returns (rfc message id, body text) for one .emlx file.
+
+    The text/plain part wins when it says something. When it is empty or a
+    placeholder, the HTML part is used instead.
+    """
+    rfc_id, body, _ = _extract(path)
+    return rfc_id, body
 
 
 def strip_markup(text: str) -> str:
@@ -550,7 +596,8 @@ CREATE TABLE IF NOT EXISTS messages (
     date_received     INTEGER,
     size              INTEGER,
     conversation_id   INTEGER,
-    indexed_at        INTEGER NOT NULL
+    indexed_at        INTEGER NOT NULL,
+    body_indexed      INTEGER NOT NULL DEFAULT 0   -- 1 when a non-trivial body was extracted
 );
 CREATE INDEX IF NOT EXISTS messages_rfc ON messages(rfc_id);
 CREATE INDEX IF NOT EXISTS messages_date ON messages(date_received);
@@ -576,15 +623,176 @@ CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 """
 
 
+# Bumped whenever a change to the tables or to what gets indexed means an
+# existing index must be rebuilt. An index with no version is version 1.
+#   2: messages.body_indexed, HTML fallback for empty text/plain parts
+SCHEMA_VERSION = 2
+
+
+class IndexSchemaError(Exception):
+    """The index on disk was built by another version of this code."""
+
+    def __init__(self, found: int, expected: int):
+        super().__init__(f"index schema version {found}, this code needs {expected}")
+        self.found = found
+        self.expected = expected
+
+
+def read_schema_version(connection: sqlite3.Connection) -> int | None:
+    """The version stamped in an index, 1 for one that predates versioning,
+    None when the file holds no index at all."""
+    tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    if "messages" not in tables:
+        return None
+    if "meta" not in tables:
+        return 1
+    row = connection.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+    try:
+        return int(row[0]) if row else 1
+    except (TypeError, ValueError):
+        return 1
+
+
 def open_index(path: str) -> sqlite3.Connection:
+    """Opens (creating it if new) the index; refuses one from another schema version.
+
+    Mixing versions would insert rows a stale table cannot hold, or leave old
+    rows without the new columns' meaning, so the caller must rebuild instead.
+    """
     connection = sqlite3.connect(path)
     connection.row_factory = sqlite3.Row
+    found = read_schema_version(connection)
+    if found is not None and found != SCHEMA_VERSION:
+        connection.close()
+        raise IndexSchemaError(found, SCHEMA_VERSION)
     # A backfill is tens of thousands of inserts; the default journal makes it
     # fsync far more often than this workload needs.
     connection.execute("PRAGMA journal_mode = WAL")
     connection.execute("PRAGMA synchronous = NORMAL")
     connection.executescript(SCHEMA)
+    connection.execute(
+        "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),)
+    )
+    connection.commit()
     return connection
+
+
+LOCK_STALE_SECONDS = 1800
+LOCK_EXIT_CODE = 75
+
+
+class IndexBusy(Exception):
+    """Another sync or build holds the index lock."""
+
+
+def _process_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+class IndexLock:
+    """Exclusive `<index>.sync.lock`, shared by --sync, --build and auto-sync.
+
+    The lock file holds the owner's PID. It is stale when that process is gone,
+    or when nobody has touched it for LOCK_STALE_SECONDS: a live owner keeps
+    it fresh with touch(), so a long build is never mistaken for a dead one.
+    """
+
+    def __init__(self, database: str):
+        self.path = database + ".sync.lock"
+        self.held = False
+
+    def _stale(self, path: str | None = None) -> bool:
+        path = path or self.path
+        try:
+            age = time.time() - os.path.getmtime(path)
+            with open(path, "r", encoding="ascii", errors="replace") as handle:
+                text = handle.read().strip()
+        except OSError:
+            return False
+        if text.isdigit() and not _process_alive(int(text)):
+            return True
+        return age > LOCK_STALE_SECONDS
+
+    def _take_over(self) -> bool:
+        """Claims a stale lock; True when this process removed it.
+
+        Two processes may both judge the lock stale. Renaming it away is atomic,
+        so only one rename succeeds; unlinking by name instead could delete the
+        fresh lock the winner has just created.
+        """
+        claimed = f"{self.path}.stale.{os.getpid()}"
+        try:
+            os.rename(self.path, claimed)
+        except FileNotFoundError:
+            return False
+        if not self._stale(claimed):
+            # What we moved was a live lock created after our check: put it back.
+            try:
+                os.link(claimed, self.path)
+            except OSError:
+                pass
+            os.unlink(claimed)
+            return False
+        os.unlink(claimed)
+        return True
+
+    def acquire(self) -> "IndexLock":
+        for _ in range(2):
+            try:
+                handle = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                if self._stale() and self._take_over():
+                    continue
+                raise IndexBusy(self.path) from None
+            with os.fdopen(handle, "w", encoding="ascii") as out:
+                out.write(str(os.getpid()))
+            self.held = True
+            return self
+        raise IndexBusy(self.path)
+
+    def touch(self) -> None:
+        if self.held:
+            try:
+                os.utime(self.path)
+            except OSError:
+                pass
+
+    def release(self) -> None:
+        if self.held:
+            self.held = False
+            try:
+                os.unlink(self.path)
+            except FileNotFoundError:
+                pass
+
+    def __enter__(self) -> "IndexLock":
+        return self.acquire()
+
+    def __exit__(self, *exc: object) -> None:
+        self.release()
+
+
+def swap_in(temporary: str, target: str) -> None:
+    """Atomically replaces the live index with a finished build.
+
+    Call with the IndexLock held. The old file's WAL and shared-memory files
+    belong to the old content: left next to the new file, SQLite could replay
+    them into it. They go first, so that no window exists where the new file
+    sits beside them; a reader that still has the old file open keeps its own
+    inode and is unaffected.
+    """
+    for suffix in ("-wal", "-shm"):
+        try:
+            os.unlink(target + suffix)
+        except FileNotFoundError:
+            pass
+    os.replace(temporary, target)
 
 
 def build(
@@ -592,7 +800,8 @@ def build(
     envelope: sqlite3.Connection,
     index: sqlite3.Connection,
     resume: bool,
-) -> None:
+    lock: IndexLock | None = None,
+) -> dict[str, int]:
     mailboxes = load_mailboxes(envelope)
     account_names = load_account_names()
 
@@ -612,6 +821,8 @@ def build(
     started = time.time()
     done = 0
     missing_file = 0
+    without_body = 0
+    recovered = 0
     for row in rows:
         identifier = row["id"]
         if identifier in already:
@@ -625,9 +836,14 @@ def build(
         account = account_names.get(account_uuid, account_uuid)
 
         path = files.get(identifier)
-        rfc_id, body = extract_text(path) if path else ("", "")
+        rfc_id, body, legacy_had_body = _extract(path) if path else ("", "", False)
         if path is None:
             missing_file += 1
+        body_indexed = has_body(body)
+        if not body_indexed:
+            without_body += 1
+        elif not legacy_had_body:
+            recovered += 1
 
         sender = row["sender"] or ""
         if row["sender_name"]:
@@ -635,8 +851,8 @@ def build(
 
         index.execute(
             "INSERT OR REPLACE INTO messages"
-            " (id, account, rfc_id, subject, sender, date_received, size, conversation_id, indexed_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?)",
+            " (id, account, rfc_id, subject, sender, date_received, size, conversation_id, indexed_at, body_indexed)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?)",
             (
                 identifier,
                 account,
@@ -647,6 +863,7 @@ def build(
                 row["size"],
                 row["conversation_id"],
                 int(started),
+                int(body_indexed),
             ),
         )
         index.execute("DELETE FROM locations WHERE message = ?", (identifier,))
@@ -682,6 +899,8 @@ def build(
         done += 1
         if done % 100 == 0:
             index.commit()
+            if lock:
+                lock.touch()
             rate = done / max(time.time() - started, 0.001)
             remaining = (len(rows) - len(already) - done) / max(rate, 0.001)
             print(f"  {done} indexed, {rate:.0f}/s, about {remaining / 60:.0f} min left")
@@ -694,6 +913,9 @@ def build(
     print(f"\nindexed {done} messages in {elapsed / 60:.1f} min")
     if missing_file:
         print(f"{missing_file} messages had no file on disk: metadata only, no body search")
+    print(f"{without_body} messages without a searchable body, "
+          f"{recovered} recovered from the HTML part")
+    return {"done": done, "missing_file": missing_file, "without_body": without_body, "recovered": recovered}
 
 
 def refresh_locations(envelope: sqlite3.Connection, index: sqlite3.Connection) -> tuple[int, int]:
@@ -788,7 +1010,12 @@ def refresh_locations(envelope: sqlite3.Connection, index: sqlite3.Connection) -
     return len(updates), len(inserts) + len(deletes)
 
 
-def sync(files: dict[int, str], envelope: sqlite3.Connection, index: sqlite3.Connection) -> None:
+def sync(
+    files: dict[int, str],
+    envelope: sqlite3.Connection,
+    index: sqlite3.Connection,
+    lock: IndexLock | None = None,
+) -> None:
     """Brings the index back in line: new messages in, gone ones out.
 
     Removal is not a special case. What Mail's index no longer lists is deleted
@@ -808,7 +1035,7 @@ def sync(files: dict[int, str], envelope: sqlite3.Connection, index: sqlite3.Con
     flags, moved = refresh_locations(envelope, index)
     print(f"refreshed {flags} flags, {moved} mailbox changes")
 
-    build(files, envelope, index, resume=True)
+    build(files, envelope, index, resume=True, lock=lock)
 
 
 def search(index: sqlite3.Connection, query: str, limit: int, sort: str = "relevance") -> None:
@@ -855,7 +1082,11 @@ def main() -> int:
     arguments = parser.parse_args()
 
     if arguments.search:
-        index = open_index(arguments.database)
+        try:
+            index = open_index(arguments.database)
+        except IndexSchemaError as error:
+            print(f"{error}. Rebuild it: python3 mail_index.py --build")
+            return 1
         search(index, arguments.search, arguments.limit, arguments.sort)
         return 0
 
@@ -894,11 +1125,36 @@ def main() -> int:
                 print("Refusing to build on assumptions that do not hold. Use --force to override.")
                 return 1
 
-        index = open_index(arguments.database)
-        if arguments.sync:
-            sync(files, envelope, index)
-        else:
-            build(files, envelope, index, resume=True)
+        lock = IndexLock(arguments.database)
+        try:
+            lock.acquire()
+        except IndexBusy:
+            print("Another sync or build is running on this index; try again when it ends.")
+            return LOCK_EXIT_CODE
+        try:
+            if arguments.sync:
+                index = open_index(arguments.database)
+                sync(files, envelope, index, lock)
+            else:
+                # Built beside the live file and swapped in at the end, so a
+                # search never meets a half-built index and a crash loses nothing.
+                temporary = arguments.database + ".building"
+                for suffix in ("", "-wal", "-shm"):
+                    try:
+                        os.unlink(temporary + suffix)
+                    except FileNotFoundError:
+                        pass
+                index = open_index(temporary)
+                build(files, envelope, index, resume=False, lock=lock)
+                index.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                index.execute("PRAGMA journal_mode = DELETE")
+                index.close()
+                swap_in(temporary, arguments.database)
+        except IndexSchemaError as error:
+            print(f"{error}. Rebuild it: python3 mail_index.py --build")
+            return 1
+        finally:
+            lock.release()
         size = os.path.getsize(arguments.database) / 1024 / 1024
         print(f"index: {arguments.database} ({size:.0f} MB)")
     return 0

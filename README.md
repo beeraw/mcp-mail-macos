@@ -257,7 +257,7 @@ in `launchd/com.mcp-mail-macos.sync.plist` before installing it.
 | --- | --- |
 | `search_all(query, account, mailbox, unread_only, flagged_only, since, until, limit, sort, snippets)` | Search every account, through the local index |
 | `get_thread(message_id, limit)` | The whole conversation a message belongs to |
-| `index_status()` | What the index holds and how old it is |
+| `index_status()` | What the index holds, how old it is, and how many messages have a searchable body (per account and overall) |
 | `sync_index()` | Bring the index up to date |
 
 `search_all` covers the whole archive in milliseconds. Subject, sender,
@@ -435,7 +435,7 @@ sender, date, `Message-ID`, locations. Reading a message goes back through
 `get_message`. For roughly 50,000 messages the index weighs about 80 MB.
 
 ```
-messages    (id, account, rfc_id, subject, sender, date_received, size, conversation_id)
+messages    (id, account, rfc_id, subject, sender, date_received, size, conversation_id, body_indexed)
 locations   (message, account, mailbox, read, flagged)
 messages_fts(subject, sender, recipients, attachments, body)   -- FTS5, content=''
 ```
@@ -466,6 +466,32 @@ refusal beats a silently wrong index.
 `--sync` diffs the set of messages Mail lists against the set the index holds.
 Deletion is not a special case, and a move reads as a change of location at
 constant `Message-ID`. A pass with nothing to do costs about two seconds.
+
+### Body coverage
+
+Some messages end up with no searchable body: the file is missing, only a
+partial download exists, or the message is empty. `messages.body_indexed` is
+`1` when a non-trivial body (at least a few word characters) was extracted and
+`0` otherwise, and `index_status` reports `with_body` and `without_body` for
+each account and overall. Those messages still match on subject, sender,
+recipients and attachment names.
+
+For `multipart/alternative` messages the `text/plain` part is used, unless it
+is empty, near-empty or a "this message contains HTML" placeholder: then the
+HTML part is stripped of markup and indexed instead.
+
+### Schema version
+
+The index carries a `schema_version` in its `meta` table (an index that
+predates versioning counts as version 1). When the code expects a newer one,
+`search_all`, `sync_index` and `mail_index.py --sync` refuse with an
+`index_outdated` error and the hint to run `python3 mail_index.py --build`;
+they never mix formats. `--build` always starts from scratch, writing to
+`<index>.building` and swapping the finished file in atomically, so the live
+index keeps answering until the new one is ready and a crashed build loses
+nothing. `--sync`, `--build` and the automatic sync share one lock file
+(`<index>.sync.lock`, holding the owner's PID and refreshed while it works), so
+they never run at the same time.
 
 ### Freshness
 

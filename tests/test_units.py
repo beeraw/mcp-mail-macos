@@ -1597,5 +1597,250 @@ class RefreshLocationsTests(unittest.TestCase):
         self.assertEqual(self.locations(12), {})
 
 
+
+class BodyExtractionTests(unittest.TestCase):
+    """extract_text: plain part first, HTML when the plain part says nothing."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+
+    def emlx(self, mime: str) -> str:
+        raw = mime.replace("\n", "\r\n").encode()
+        path = os.path.join(self.directory.name, f"{len(os.listdir(self.directory.name))}.emlx")
+        with open(path, "wb") as handle:
+            handle.write(str(len(raw)).encode() + b"\n" + raw)
+        return path
+
+    def alternative(self, plain: str, html: str) -> str:
+        return self.emlx(
+            "Message-ID: <a1@example.com>\n"
+            "Subject: Example\n"
+            "MIME-Version: 1.0\n"
+            'Content-Type: multipart/alternative; boundary="B"\n\n'
+            "--B\nContent-Type: text/plain; charset=utf-8\n\n" + plain + "\n"
+            "--B\nContent-Type: text/html; charset=utf-8\n\n" + html + "\n--B--\n"
+        )
+
+    def test_plain_part_wins_when_it_has_content(self):
+        path = self.alternative(
+            "The quarterly figures are attached for review.", "<p>Different html wording</p>"
+        )
+        self.assertEqual(
+            mail_index.extract_text(path),
+            ("a1@example.com", "The quarterly figures are attached for review."),
+        )
+
+    def test_empty_plain_falls_back_to_html(self):
+        path = self.alternative("", "<html><body><p>Meeting moved to <b>Friday</b></p></body></html>")
+        self.assertEqual(mail_index.extract_text(path)[1], "Meeting moved to Friday")
+
+    def test_whitespace_only_plain_falls_back_to_html(self):
+        path = self.alternative("   ", "<p>Invoice reminder for Example Ltd</p>")
+        self.assertEqual(mail_index.extract_text(path)[1], "Invoice reminder for Example Ltd")
+
+    def test_placeholder_plain_falls_back_to_html(self):
+        path = self.alternative(
+            "This message contains HTML. Please use an HTML-capable client.",
+            "<p>The delivery slot is booked for Monday morning.</p>",
+        )
+        self.assertEqual(
+            mail_index.extract_text(path)[1], "The delivery slot is booked for Monday morning."
+        )
+
+    def test_short_genuine_plain_is_kept_when_html_adds_nothing(self):
+        path = self.alternative("OK, thanks", "<p>OK</p>")
+        self.assertEqual(mail_index.extract_text(path)[1], "OK, thanks")
+
+    def test_empty_plain_and_empty_html_gives_no_body(self):
+        path = self.alternative("", "<p> </p>")
+        self.assertFalse(mail_index.has_body(mail_index.extract_text(path)[1]))
+
+    def test_html_only_message_is_unchanged(self):
+        path = self.emlx(
+            "Message-ID: <h1@example.com>\nContent-Type: text/html; charset=utf-8\n\n<p>Hello Jane</p>\n"
+        )
+        self.assertEqual(mail_index.extract_text(path)[1], "Hello Jane")
+
+    def test_legacy_flag_tells_what_the_old_logic_missed(self):
+        path = self.alternative("", "<p>Meeting moved to Friday</p>")
+        _, body, legacy_had_body = mail_index._extract(path)
+        self.assertTrue(mail_index.has_body(body))
+        self.assertFalse(legacy_had_body)
+
+    def test_unreadable_file_has_no_body(self):
+        _, body, legacy = mail_index._extract(os.path.join(self.directory.name, "missing.emlx"))
+        self.assertEqual((body, legacy), ("", False))
+
+    def test_has_body_threshold(self):
+        self.assertFalse(mail_index.has_body(" \n -- "))
+        self.assertTrue(mail_index.has_body("Yes"))
+
+
+class SchemaVersionTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.path = os.path.join(self.directory.name, "index.sqlite")
+
+    def test_new_index_is_stamped(self):
+        index = mail_index.open_index(self.path)
+        self.assertEqual(mail_index.read_schema_version(index), mail_index.SCHEMA_VERSION)
+        index.close()
+        mail_index.open_index(self.path).close()  # reopening the same version is fine
+
+    def test_index_without_stamp_is_version_one_and_refused(self):
+        legacy = sqlite3.connect(self.path)
+        legacy.executescript(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY);"
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);"
+        )
+        legacy.close()
+        with self.assertRaises(mail_index.IndexSchemaError) as caught:
+            mail_index.open_index(self.path)
+        self.assertEqual(caught.exception.found, 1)
+
+    def test_search_refuses_an_outdated_index_with_rebuild_hint(self):
+        legacy = sqlite3.connect(self.path)
+        legacy.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY)")
+        legacy.close()
+        with mock.patch.object(mail_search, "INDEX_PATH", self.path):
+            with self.assertRaises(MailError) as caught:
+                mail_search.search_all("anything", max_age_minutes=10**9)
+            self.assertEqual(caught.exception.code, "index_outdated")
+            self.assertIn("--build", caught.exception.hint)
+            with self.assertRaises(MailError) as caught:
+                mail_search.sync_index()
+            self.assertEqual(caught.exception.code, "index_outdated")
+
+    def test_swap_in_replaces_file_and_drops_stale_wal(self):
+        for suffix, content in (("", b"old"), ("-wal", b"w"), ("-shm", b"s"), (".building", b"new")):
+            with open(self.path + suffix, "wb") as handle:
+                handle.write(content)
+        mail_index.swap_in(self.path + ".building", self.path)
+        with open(self.path, "rb") as handle:
+            self.assertEqual(handle.read(), b"new")
+        self.assertFalse(os.path.exists(self.path + "-wal"))
+        self.assertFalse(os.path.exists(self.path + "-shm"))
+        self.assertFalse(os.path.exists(self.path + ".building"))
+
+
+class IndexStatusCoverageTests(_FictionalIndexMixin, unittest.TestCase):
+    def test_totals_split_by_body_indexed(self):
+        connection = sqlite3.connect(self.path)
+        connection.execute("UPDATE messages SET body_indexed = 1 WHERE id IN (1, 2, 3)")
+        connection.execute("UPDATE messages SET account = 'Home' WHERE id = 6")
+        connection.commit()
+        connection.close()
+        status = mail_search.index_status()
+        self.assertEqual((status["indexed_messages"], status["with_body"], status["without_body"]), (6, 3, 3))
+        work = next(entry for entry in status["accounts"] if entry["account"] == "Work")
+        self.assertEqual((work["messages"], work["with_body"], work["without_body"]), (5, 3, 2))
+
+
+
+class IndexLockTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.database = os.path.join(self.directory.name, "index.sqlite")
+
+    def test_second_holder_is_refused_until_release(self):
+        first = mail_index.IndexLock(self.database).acquire()
+        with self.assertRaises(mail_index.IndexBusy):
+            mail_index.IndexLock(self.database).acquire()
+        first.release()
+        mail_index.IndexLock(self.database).acquire().release()
+        self.assertFalse(os.path.exists(self.database + ".sync.lock"))
+
+    def test_lock_of_a_dead_process_is_taken_over(self):
+        with open(self.database + ".sync.lock", "w") as handle:
+            handle.write("999999999")
+        with mock.patch.object(mail_index, "_process_alive", return_value=False):
+            mail_index.IndexLock(self.database).acquire().release()
+
+    def test_old_lock_of_a_live_owner_expires_only_without_heartbeat(self):
+        owner = mail_index.IndexLock(self.database).acquire()
+        old = time.time() - mail_index.LOCK_STALE_SECONDS - 60
+        os.utime(owner.path, (old, old))
+        owner.touch()  # the running build's heartbeat
+        with self.assertRaises(mail_index.IndexBusy):
+            mail_index.IndexLock(self.database).acquire()
+        os.utime(owner.path, (old, old))  # no heartbeat for too long
+        mail_index.IndexLock(self.database).acquire().release()
+
+    def test_swap_in_removes_old_wal_before_replacing(self):
+        calls = []
+        real_replace = os.replace
+        for suffix, content in (("", b"old"), ("-wal", b"w"), ("-shm", b"s"), (".building", b"new")):
+            with open(self.database + suffix, "wb") as handle:
+                handle.write(content)
+
+        def spy(source, target):
+            calls.append(os.path.exists(self.database + "-wal"))
+            real_replace(source, target)
+
+        with mock.patch.object(mail_index.os, "replace", spy):
+            mail_index.swap_in(self.database + ".building", self.database)
+        self.assertEqual(calls, [False])
+
+    def test_sync_index_reports_busy_index(self):
+        completed = mock.Mock(returncode=mail_index.LOCK_EXIT_CODE, stdout=b"", stderr=b"")
+        with mock.patch.object(mail_search, "INDEX_PATH", self.database), \
+                mock.patch("subprocess.run", return_value=completed):
+            with self.assertRaises(MailError) as caught:
+                mail_search.sync_index()
+        self.assertEqual(caught.exception.code, "index_busy")
+
+    def test_search_reports_file_without_message_table(self):
+        sqlite3.connect(self.database).close()
+        with mock.patch.object(mail_search, "INDEX_PATH", self.database):
+            with self.assertRaises(MailError) as caught:
+                mail_search.search_all("anything", max_age_minutes=10**9)
+        self.assertEqual(caught.exception.code, "index_invalid")
+
+
+
+class IndexLockRaceTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.database = os.path.join(self.directory.name, "index.sqlite")
+        self.path = self.database + ".sync.lock"
+
+    def test_loser_of_a_stale_takeover_does_not_delete_the_winners_lock(self):
+        with open(self.path, "w") as handle:
+            handle.write("999999999")
+        loser = mail_index.IndexLock(self.database)
+        winner = mail_index.IndexLock(self.database)
+        real_stale = loser._stale
+        state = {"winner": None}
+
+        def stale_then_winner_acts(path=None):
+            answer = real_stale(path)
+            if path is None and state["winner"] is None:
+                # The loser has judged the lock stale; now the winner takes over.
+                state["winner"] = winner.acquire()
+            return answer
+
+        with mock.patch.object(mail_index, "_process_alive", side_effect=lambda pid: pid != 999999999), \
+                mock.patch.object(loser, "_stale", stale_then_winner_acts):
+            with self.assertRaises(mail_index.IndexBusy):
+                loser.acquire()
+        self.assertTrue(os.path.exists(self.path))
+        with open(self.path) as handle:
+            self.assertEqual(handle.read(), str(os.getpid()))
+        state["winner"].release()
+
+    def test_rename_lost_race_reports_busy(self):
+        with open(self.path, "w") as handle:
+            handle.write("999999999")
+        lock = mail_index.IndexLock(self.database)
+        with mock.patch.object(mail_index, "_process_alive", return_value=False), \
+                mock.patch.object(mail_index.os, "rename", side_effect=FileNotFoundError):
+            with self.assertRaises(mail_index.IndexBusy):
+                lock.acquire()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -41,6 +41,36 @@ RECENCY_HALF_LIFE_DAYS = 365.0
 SORT_MODES = ("relevance", "date")
 
 
+def _require_current_schema(connection: sqlite3.Connection) -> None:
+    """Refuses an index built by another version of the code.
+
+    Rebuilding on the fly would hold a search for many minutes and need Full
+    Disk Access, so the caller is told to rebuild rather than surprised.
+    """
+    import mail_index
+
+    try:
+        found = mail_index.read_schema_version(connection)
+    except sqlite3.DatabaseError:
+        found = None
+    if found is None:
+        connection.close()
+        raise MailError(
+            "index_invalid",
+            "The index file holds no message table (empty or not an index).",
+            "Rebuild it: python3 mail_index.py --build",
+        )
+    if found != mail_index.SCHEMA_VERSION:
+        connection.close()
+        raise MailError(
+            "index_outdated",
+            f"The search index uses schema version {found}, this server needs "
+            f"{mail_index.SCHEMA_VERSION}.",
+            "Rebuild it: python3 mail_index.py --build (the current index keeps working "
+            "until the new one is ready).",
+        )
+
+
 def _connect() -> sqlite3.Connection:
     if not os.path.isfile(INDEX_PATH):
         raise MailError(
@@ -50,6 +80,7 @@ def _connect() -> sqlite3.Connection:
         )
     connection = sqlite3.connect(f"file:{INDEX_PATH}?mode=ro", uri=True)
     connection.row_factory = sqlite3.Row
+    _require_current_schema(connection)
     return connection
 
 
@@ -106,16 +137,6 @@ def _refresh_if_stale(max_age_minutes: float) -> dict[str, Any]:
     if age is None or age <= max_age_minutes:
         return {"synced": False, "index_age_minutes": round(age, 1) if age else 0.0}
 
-    lock_path = INDEX_PATH + ".sync.lock"
-    try:
-        # A stale lock from a killed run must not block every later search.
-        if os.path.exists(lock_path) and time.time() - os.path.getmtime(lock_path) > 1800:
-            os.unlink(lock_path)
-        handle = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.close(handle)
-    except FileExistsError:
-        return {"synced": False, "index_age_minutes": round(age, 1), "sync_note": "already running"}
-
     try:
         result = sync_index()
         return {
@@ -125,17 +146,14 @@ def _refresh_if_stale(max_age_minutes: float) -> dict[str, Any]:
             "sync_removed": result["removed"],
         }
     except MailError as error:
+        if error.code == "index_busy":
+            return {"synced": False, "index_age_minutes": round(age, 1), "sync_note": "already running"}
         return {
             "synced": False,
             "index_age_minutes": round(age, 1),
             "sync_note": f"{error.code}: {error.message}",
             "sync_hint": error.hint,
         }
-    finally:
-        try:
-            os.unlink(lock_path)
-        except OSError:
-            pass
 
 
 def _mailbox_sizes(connection: sqlite3.Connection) -> dict[tuple[str, str], int]:
@@ -414,6 +432,11 @@ def sync_index(timeout: int = 900) -> dict[str, Any]:
     """
     import subprocess
 
+    if os.path.isfile(INDEX_PATH):
+        probe = sqlite3.connect(f"file:{INDEX_PATH}?mode=ro", uri=True)
+        _require_current_schema(probe)
+        probe.close()
+
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mail_index.py")
     try:
         completed = subprocess.run(
@@ -430,6 +453,12 @@ def sync_index(timeout: int = 900) -> dict[str, Any]:
 
     output = completed.stdout.decode("utf-8", errors="replace")
     if completed.returncode != 0:
+        if completed.returncode == 75:
+            raise MailError(
+                "index_busy",
+                "Another sync or build is already running on the index.",
+                "Try again in a few minutes.",
+            )
         detail = completed.stderr.decode("utf-8", errors="replace").strip() or output
         if "Permission denied" in output or "Operation not permitted" in detail:
             raise MailError(
@@ -470,7 +499,12 @@ def sync_index(timeout: int = 900) -> dict[str, Any]:
 
 
 def index_status() -> dict[str, Any]:
-    """Reports what the index holds and how old it is."""
+    """Reports what the index holds and how old it is.
+
+    with_body / without_body say how many messages have searchable body text:
+    the others (file missing, partial download, empty message) only match on
+    subject, sender, recipients and attachment names.
+    """
     connection = _connect()
     try:
         messages = connection.execute("SELECT count(*) FROM messages").fetchone()[0]
@@ -482,15 +516,24 @@ def index_status() -> dict[str, Any]:
             "SELECT value FROM meta WHERE key = 'last_build'"
         ).fetchone()
         accounts = [
-            {"account": row["account"], "messages": row["n"]}
+            {
+                "account": row["account"],
+                "messages": row["n"],
+                "with_body": row["with_body"],
+                "without_body": row["n"] - row["with_body"],
+            }
             for row in connection.execute(
-                "SELECT account, count(*) AS n FROM messages GROUP BY account ORDER BY n DESC"
+                "SELECT account, count(*) AS n, coalesce(sum(body_indexed), 0) AS with_body"
+                "  FROM messages GROUP BY account ORDER BY n DESC"
             )
         ]
+        with_body = sum(account["with_body"] for account in accounts)
         built_at = int(built[0]) if built and built[0] else None
         return {
             "ok": True,
             "indexed_messages": messages,
+            "with_body": with_body,
+            "without_body": messages - with_body,
             "mailbox_memberships": locations,
             "accounts": accounts,
             "oldest": time.strftime("%Y-%m-%d", time.localtime(span[0])) if span[0] else None,
