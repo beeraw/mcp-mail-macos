@@ -297,8 +297,52 @@ def _quoted_original(original: dict[str, Any]) -> str:
     )
 
 
-def reply_recipients(original: dict[str, Any], reply_all: bool) -> dict[str, Any]:
-    """Works out who a reply goes to, so the preview and the sent reply agree."""
+_PLAIN_ADDRESS = re.compile(r"^[^@\s<>,;]+@[^@\s<>,;]+\.[^@\s<>,;]+$")
+
+
+def _explicit_addresses(value: str | Sequence[str] | None, parameter: str) -> list[str]:
+    """Addresses the caller asked for by hand, checked because nobody else has.
+
+    The recipients computed from the original come from headers Mail already
+    accepted; these come from the model, and a typo would otherwise fail deep
+    inside the SMTP exchange, after the preview was confirmed.
+    """
+    if value is None:
+        return []
+    items = [value.replace(";", ",")] if isinstance(value, str) else list(value)
+    found: list[str] = []
+    for item in items:
+        if not str(item).strip():
+            continue
+        addresses = _addresses_of(str(item))
+        if not addresses or not all(_PLAIN_ADDRESS.match(a) for a in addresses):
+            raise MailError(
+                "invalid_address",
+                f"{parameter} holds something that is not an address: {str(item)!r}.",
+                "Give plain addresses such as name@example.com.",
+            )
+        found.extend(addresses)
+    return _addresses_of(", ".join(found)) if found else []
+
+
+def reply_recipients(
+    original: dict[str, Any],
+    reply_all: bool,
+    add_to: str | Sequence[str] | None = None,
+    add_cc: str | Sequence[str] | None = None,
+    bcc: str | Sequence[str] | None = None,
+) -> dict[str, Any]:
+    """Works out who a reply goes to, so the preview and the sent reply agree.
+
+    add_to, add_cc and bcc only ever add to the computed recipients. An address
+    is never listed twice: one asked for in To that was already in Cc moves up
+    to To, one asked for in Cc that is already in To stays there, and a blind
+    copy never repeats a visible recipient. An explicit request wins over the
+    usual filtering, so the account's own address is kept if it is asked for.
+    """
+    extra_to = _explicit_addresses(add_to, "add_to")
+    extra_cc = _explicit_addresses(add_cc, "add_cc")
+    extra_bcc = _explicit_addresses(bcc, "bcc")
     answer_to = _addresses_of(original.get("reply_to") or original.get("sender") or "")
     if not answer_to:
         raise MailError(
@@ -330,9 +374,32 @@ def reply_recipients(original: dict[str, Any], reply_all: bool) -> dict[str, Any
             if address.lower() not in mine and address.lower() not in answered
         ]
 
+    computed = {address.lower() for address in answer_to + copies}
+    to = list(answer_to)
+    for address in extra_to:
+        if address.lower() not in {a.lower() for a in to}:
+            to.append(address)
+    in_to = {address.lower() for address in to}
+    cc = [address for address in copies if address.lower() not in in_to]
+    for address in extra_cc:
+        if address.lower() not in in_to | {a.lower() for a in cc}:
+            cc.append(address)
+    visible = in_to | {address.lower() for address in cc}
+    blind: list[str] = []
+    for address in extra_bcc:
+        if address.lower() not in visible | {a.lower() for a in blind}:
+            blind.append(address)
+
+    added = [
+        address
+        for address in to + cc + blind
+        if address.lower() not in computed
+    ]
     return {
-        "to": answer_to,
-        "cc": copies,
+        "to": to,
+        "cc": cc,
+        "bcc": blind,
+        "added": added,
         "account": account,
         "from_address": from_address,
     }
@@ -345,6 +412,9 @@ def reply(
     attachments: Sequence[str] | None = None,
     as_draft: bool = False,
     signature: bool = True,
+    add_to: str | Sequence[str] | None = None,
+    add_cc: str | Sequence[str] | None = None,
+    bcc: str | Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Answers a message, staying attached to its thread.
 
@@ -357,9 +427,10 @@ def reply(
 
     original = mail_tools.get_message(message_id, max_body_chars=200_000)
 
-    recipients = reply_recipients(original, reply_all)
+    recipients = reply_recipients(original, reply_all, add_to, add_cc, bcc)
     answer_to = recipients["to"]
     copies = recipients["cc"]
+    blind = recipients["bcc"]
     account = recipients["account"]
     from_address = recipients["from_address"]
 
@@ -385,6 +456,7 @@ def reply(
         # HTML already and the plain body would go out with its newlines lost.
         body=mail_message.to_html(body) + _quoted_original(original),
         cc=copies,
+        bcc=blind,
         attachments=attachments,
         sender=from_address or None,
         signature=signature,
@@ -395,6 +467,7 @@ def reply(
     result = _recap(prepared, subject)
     result["threaded"] = bool(parent)
     result["replying_to"] = original.get("subject") or ""
+    result["added"] = recipients["added"]
     if as_draft:
         filed = mail_imap.append_draft(
             prepared["account"]["name"], prepared["message"].as_bytes()
@@ -402,10 +475,14 @@ def reply(
         result.update({"ok": True, "mode": "draft", "sent": False, "mailbox": filed["folder"]})
         return result
 
+    # The blind copies travel in the envelope only: left in the header, every
+    # other recipient would read them. A draft keeps the header so Mail shows it.
     message = prepared["message"]
     del message["Bcc"]
     delivered = mail_imap.send_message(
-        prepared["account"]["name"], message.as_bytes(), prepared["to"] + prepared["cc"]
+        prepared["account"]["name"],
+        message.as_bytes(),
+        prepared["to"] + prepared["cc"] + prepared["bcc"],
     )
     result.update({"ok": True, "mode": "send", "sent": True, "server": delivered["server"]})
     result.update(mail_imap.sent_copy_fields(delivered))

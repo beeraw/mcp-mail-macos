@@ -412,6 +412,9 @@ def reply_to_message(
     attachments: list[str] | None = None,
     send: bool = True,
     confirm: bool = False,
+    add_to: str | list[str] | None = None,
+    add_cc: str | list[str] | None = None,
+    bcc: str | list[str] | None = None,
 ) -> dict[str, Any]:
     """Reply to an existing message, keeping it in the same thread.
 
@@ -427,6 +430,14 @@ def reply_to_message(
         send: send straight away; set to false to leave the reply in Drafts.
         confirm: required when send is true. Without it, who the reply would go
             to comes back as a preview and nothing is sent.
+        add_to: extra addresses for To. They are added to the people the reply
+            already goes to, never replace them; an address already in Cc moves
+            to To.
+        add_cc: extra addresses for Cc, added to the computed ones. Skipped
+            when the address is already in To.
+        bcc: blind carbon copy addresses, never shown to the other recipients
+            and never repeating a To or Cc address. Kept visible to you in a
+            draft (send false).
     """
     return _guard(
         mail_tools.reply_to_message,
@@ -436,6 +447,9 @@ def reply_to_message(
         attachments=attachments,
         send=send,
         confirm=confirm,
+        add_to=add_to,
+        add_cc=add_cc,
+        bcc=bcc,
     )
 
 

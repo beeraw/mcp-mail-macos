@@ -670,6 +670,111 @@ class ReplyTests(unittest.TestCase):
         self.assertEqual(mail_draft._readable_date("pas une date"), "pas une date")
 
 
+class ReplyExtraRecipientsTests(unittest.TestCase):
+    """add_to, add_cc and bcc on a reply, with Mail, IMAP and SMTP stubbed."""
+
+    ORIGINAL = {
+        "account": "Work",
+        "subject": "Quote",
+        "sender": "Alice <alice@example.org>",
+        "reply_to": "",
+        "to": "me@example.com, Bob <bob@example.org>",
+        "cc": "carol@example.org",
+        "body": "Hello",
+        "date_received": "",
+        "rfc_message_id": "orig@example.org",
+        "headers": "",
+    }
+
+    def setUp(self):
+        patch = _Patch(self)
+        account = {"name": "Work", "id": "ACCOUNT-UUID", "type": "imap", "addresses": ["me@example.com"]}
+        patch(mail_draft, "accounts", lambda: [account])
+        patch(mail_signature, "signature_for_account", lambda account_id: None)
+        patch(socket, "getfqdn", lambda name="": "example.com")
+        patch(mail_tools, "get_message", lambda message_id, max_body_chars=0: dict(self.ORIGINAL))
+        self.sent = []
+        self.drafts = []
+        patch(
+            mail_imap,
+            "send_message",
+            lambda account, raw, envelope: self.sent.append((raw, envelope)) or {"server": "smtp.example.com"},
+        )
+        patch(mail_imap, "sent_copy_fields", lambda delivered: {})
+        patch(mail_imap, "append_draft", lambda account, raw: self.drafts.append(raw) or {"folder": "Drafts"})
+
+    def _recipients(self, reply_all=True, **extra):
+        return mail_draft.reply_recipients(dict(self.ORIGINAL), reply_all, **extra)
+
+    def test_nothing_added_leaves_the_computed_recipients_alone(self):
+        found = self._recipients()
+        self.assertEqual(found["to"], ["alice@example.org"])
+        self.assertEqual(found["cc"], ["bob@example.org", "carol@example.org"])
+        self.assertEqual(found["bcc"], [])
+        self.assertEqual(found["added"], [])
+
+    def test_add_cc_works_when_answering_the_sender_alone(self):
+        found = self._recipients(reply_all=False, add_cc="dave@example.org")
+        self.assertEqual(found["cc"], ["dave@example.org"])
+        self.assertEqual(found["added"], ["dave@example.org"])
+
+    def test_a_display_name_and_a_bare_address_are_the_same_recipient(self):
+        found = self._recipients(add_to=["Alice B <ALICE@example.org>"], add_cc=["Carol <carol@EXAMPLE.org>"])
+        self.assertEqual(found["to"], ["alice@example.org"])
+        self.assertEqual(found["cc"], ["bob@example.org", "carol@example.org"])
+        self.assertEqual(found["added"], [])
+
+    def test_an_address_added_to_to_moves_up_from_cc(self):
+        found = self._recipients(add_to="carol@example.org")
+        self.assertEqual(found["to"], ["alice@example.org", "carol@example.org"])
+        self.assertEqual(found["cc"], ["bob@example.org"])
+
+    def test_an_address_added_to_cc_already_in_to_stays_in_to(self):
+        found = self._recipients(add_cc="alice@example.org")
+        self.assertNotIn("alice@example.org", found["cc"])
+
+    def test_bcc_never_repeats_a_visible_recipient(self):
+        found = self._recipients(bcc="bob@example.org; dave@example.org, DAVE@example.org")
+        self.assertEqual(found["bcc"], ["dave@example.org"])
+
+    def test_an_own_address_is_kept_when_explicitly_asked_for(self):
+        found = self._recipients(add_cc="me@example.com")
+        self.assertIn("me@example.com", found["cc"])
+
+    def test_an_invalid_address_is_refused(self):
+        for parameter in ("add_to", "add_cc", "bcc"):
+            with self.subTest(parameter=parameter):
+                with self.assertRaises(MailError) as caught:
+                    self._recipients(**{parameter: ["not an address"]})
+                self.assertEqual(caught.exception.code, "invalid_address")
+
+    def test_the_preview_shows_added_and_blind_recipients(self):
+        preview = mail_tools.reply_to_message(
+            "id", "Thanks", add_to="dave@example.org", bcc="erin@example.org"
+        )
+        self.assertEqual(preview["error_code"], "confirmation_required")
+        shown = preview["preview"]
+        self.assertIn("dave@example.org", shown["will_go_to"])
+        self.assertEqual(shown["blind_copied_to"], "erin@example.org")
+        self.assertEqual(shown["added"], ["dave@example.org", "erin@example.org"])
+        self.assertEqual(self.sent, [])
+
+    def test_a_sent_reply_puts_bcc_in_the_envelope_but_not_in_the_header(self):
+        result = mail_draft.reply("id", "Thanks", bcc="erin@example.org", add_cc="dave@example.org")
+        raw, envelope = self.sent[0]
+        self.assertIn("erin@example.org", envelope)
+        self.assertIn("dave@example.org", envelope)
+        parsed = email.message_from_bytes(raw)
+        self.assertIsNone(parsed["Bcc"])
+        self.assertNotIn(b"erin@example.org", raw)
+        self.assertEqual(result["added"], ["dave@example.org", "erin@example.org"])
+
+    def test_a_draft_keeps_the_bcc_header(self):
+        mail_draft.reply("id", "Thanks", as_draft=True, bcc="erin@example.org")
+        self.assertEqual(email.message_from_bytes(self.drafts[0])["Bcc"], "erin@example.org")
+        self.assertEqual(self.sent, [])
+
+
 class PartClassificationTests(unittest.TestCase):
     """What the reader actually receives, told apart from what only decorates."""
 

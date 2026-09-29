@@ -688,6 +688,9 @@ def reply_to_message(
     attachments: Sequence[str] | None = None,
     send: bool = True,
     confirm: bool = False,
+    add_to: str | Sequence[str] | None = None,
+    add_cc: str | Sequence[str] | None = None,
+    bcc: str | Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Answers a message, staying attached to its thread.
 
@@ -701,7 +704,7 @@ def reply_to_message(
     attachment_paths = _check_attachments(attachments)
     if send and not confirm:
         original = get_message(message_id, max_body_chars=400)
-        recipients = mail_draft.reply_recipients(original, reply_all)
+        recipients = mail_draft.reply_recipients(original, reply_all, add_to, add_cc, bcc)
         return _confirmation_needed(
             "sending this reply",
             {
@@ -710,6 +713,8 @@ def reply_to_message(
                 "original_sender": original["sender"],
                 "will_go_to": ", ".join(recipients["to"]),
                 "copied_to": ", ".join(recipients["cc"]),
+                "blind_copied_to": ", ".join(recipients["bcc"]),
+                "added": recipients["added"],
                 "reply_all": reply_all,
                 "body": body,
                 "attachments": [os.path.basename(path) for path in attachment_paths],
@@ -722,6 +727,9 @@ def reply_to_message(
         reply_all=reply_all,
         attachments=attachments,
         as_draft=not send,
+        add_to=add_to,
+        add_cc=add_cc,
+        bcc=bcc,
     )
 
 
