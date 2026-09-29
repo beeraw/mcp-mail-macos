@@ -607,14 +607,27 @@ def sync(files: dict[int, str], envelope: sqlite3.Connection, index: sqlite3.Con
     build(files, envelope, index, resume=True)
 
 
-def search(index: sqlite3.Connection, query: str, limit: int) -> None:
+def search(index: sqlite3.Connection, query: str, limit: int, sort: str = "relevance") -> None:
+    """Prints the hits; same ranking as mail_search.search_all."""
+    if sort == "date":
+        order, extra = "m.date_received DESC", []
+    else:
+        import mail_search  # deferred: keeps the indexer importable on its own
+
+        weights = ", ".join(str(weight) for weight in mail_search.BM25_WEIGHTS)
+        order = (
+            f"bm25(messages_fts, {weights})"
+            " * (1 + ? / (1 + max(? - coalesce(m.date_received, 0), 0) / 86400.0 / ?)),"
+            " m.date_received DESC"
+        )
+        extra = [mail_search.RECENCY_BOOST, int(time.time()), mail_search.RECENCY_HALF_LIFE_DAYS]
     rows = index.execute(
         "SELECT m.id, m.account, m.subject, m.sender, m.date_received,"
         "       (SELECT group_concat(mailbox, ', ') FROM locations WHERE message = m.id) AS boxes"
         "  FROM messages_fts f JOIN messages m ON m.id = f.rowid"
         " WHERE messages_fts MATCH ?"
-        " ORDER BY m.date_received DESC LIMIT ?",
-        (query, limit),
+        f" ORDER BY {order} LIMIT ?",
+        (query, *extra, limit),
     ).fetchall()
     print(f"{len(rows)} hit(s)\n")
     for row in rows:
@@ -631,13 +644,15 @@ def main() -> int:
     parser.add_argument("--sync", action="store_true", help="incremental update")
     parser.add_argument("--search", metavar="QUERY", help="query the index")
     parser.add_argument("--limit", type=int, default=20)
+    parser.add_argument("--sort", choices=("relevance", "date"), default="relevance",
+                        help="order of --search hits (default: relevance)")
     parser.add_argument("--database", default=DEFAULT_DATABASE)
     parser.add_argument("--force", action="store_true", help="build even if the checks fail")
     arguments = parser.parse_args()
 
     if arguments.search:
         index = open_index(arguments.database)
-        search(index, arguments.search, arguments.limit)
+        search(index, arguments.search, arguments.limit, arguments.sort)
         return 0
 
     if not (arguments.check or arguments.build or arguments.sync):

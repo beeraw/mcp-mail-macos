@@ -106,6 +106,7 @@ def search_all(
     since: str | None = None,
     until: str | None = None,
     limit: int = 20,
+    sort: str = "relevance",
 ) -> dict[str, Any]:
     """Search every message of every account, from the local index.
 
@@ -118,6 +119,11 @@ def search_all(
     Words can be restricted to one field with "subject: facture", combined with
     AND / OR / NOT, and quoted for an exact phrase.
 
+    Results come best match first by default: a word in the subject counts
+    most, then the sender, attachment names, and finally recipients and body,
+    with a moderate bonus for recent mail. Use sort="date" when you want the
+    latest messages matching a query rather than the best ones.
+
     Args:
         query: what to look for.
         account: restrict to one account.
@@ -127,6 +133,7 @@ def search_all(
         since: earliest date, YYYY-MM-DD.
         until: latest date, YYYY-MM-DD.
         limit: how many messages to return (max 200).
+        sort: "relevance" (default, best match first) or "date" (newest first).
     """
     return _guard(
         mail_search.search_all,
@@ -138,6 +145,7 @@ def search_all(
         since=since,
         until=until,
         limit=limit,
+        sort=sort,
     )
 
 

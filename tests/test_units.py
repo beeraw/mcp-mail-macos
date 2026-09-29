@@ -21,6 +21,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -972,6 +973,85 @@ class SendDraftTests(unittest.TestCase):
         self.assertFalse(answer["draft_removed"])
         self.assertEqual(self.deleted, [])
         self.assertIn("sent_copy_warning", answer)
+
+
+class SearchRankingTests(unittest.TestCase):
+    """search_all ordering, on a throwaway FTS5 index of fictional messages."""
+
+    DAY = 86400
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.directory.name, "index.sqlite")
+        index = mail_index.open_index(self.path)
+        now = int(time.time())
+        # id, subject, sender, recipients, attachments, body, age in days
+        rows = [
+            (1, "Weekly notes", "jane@example.com", "", "", "the roadmap is discussed here", 1),
+            (2, "Roadmap review", "john@example.org", "", "", "see you there", 400),
+            (3, "Kickoff", "jane@example.com", "", "", "roadmap", 2000),
+            (4, "Shared plan", "jane@example.com", "", "", "quarterly budget figures", 500),
+            (5, "Shared plan", "jane@example.com", "", "", "quarterly budget figures", 3),
+            (6, "Shared plan", "jane@example.com", "", "", "quarterly budget figures", None),
+        ]
+        for identifier, subject, sender, recipients, attachments, body, age in rows:
+            index.execute(
+                "INSERT INTO messages (id, account, subject, sender, date_received, indexed_at)"
+                " VALUES (?, 'Work', ?, ?, ?, ?)",
+                (identifier, subject, sender, None if age is None else now - age * self.DAY, now),
+            )
+            index.execute(
+                "INSERT INTO messages_fts (rowid, subject, sender, recipients, attachments, body)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (identifier, subject, sender, recipients, attachments, body),
+            )
+            index.execute(
+                "INSERT INTO locations (message, account, mailbox, read, flagged)"
+                " VALUES (?, 'Work', 'INBOX', 1, 0)",
+                (identifier,),
+            )
+        index.commit()
+        index.close()
+        patcher = mock.patch.object(mail_search, "INDEX_PATH", self.path)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self.directory.cleanup)
+
+    def ids(self, query, **kwargs):
+        result = mail_search.search_all(query, max_age_minutes=10**9, **kwargs)
+        return [message["mail_id"] for message in result["messages"]]
+
+    def test_a_subject_hit_outranks_a_body_only_hit(self):
+        # Mail 1 is far more recent, but only mentions the word in its body.
+        self.assertEqual(self.ids("roadmap")[0], 2)
+
+    def test_a_strong_old_match_beats_a_weak_recent_one(self):
+        ranked = self.ids("roadmap")
+        self.assertLess(ranked.index(2), ranked.index(1))
+
+    def test_date_sort_keeps_newest_first(self):
+        self.assertEqual(self.ids("roadmap", sort="date"), [1, 2, 3])
+
+    def test_relevance_is_the_default_and_is_reported(self):
+        result = mail_search.search_all("roadmap", max_age_minutes=10**9)
+        self.assertEqual(result["sort"], "relevance")
+
+    def test_an_unknown_sort_is_refused(self):
+        with self.assertRaises(MailError) as caught:
+            mail_search.search_all("roadmap", sort="best", max_age_minutes=10**9)
+        self.assertEqual(caught.exception.code, "invalid_sort")
+
+    def test_recency_breaks_ties_between_equal_matches(self):
+        self.assertEqual(self.ids("budget"), [5, 4, 6])
+
+    def test_a_null_dated_match_does_not_rank_first(self):
+        self.assertNotEqual(self.ids("budget")[0], 6)
+
+    def test_ranking_survives_the_quoted_terms_retry(self):
+        result = mail_search.search_all("plan 12/2025", max_age_minutes=10**9)
+        self.assertIn("interpreted_as", result)
+        self.assertEqual(result["messages"], [])
+        self.assertEqual(self.ids("shared/plan"), [5, 4, 6])
 
 
 class SearchEvaluationTests(unittest.TestCase):

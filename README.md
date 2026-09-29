@@ -255,7 +255,7 @@ in `launchd/com.mcp-mail-macos.sync.plist` before installing it.
 
 | Tool | Purpose |
 | --- | --- |
-| `search_all(query, account, mailbox, unread_only, flagged_only, since, until, limit)` | Search every account, through the local index |
+| `search_all(query, account, mailbox, unread_only, flagged_only, since, until, limit, sort)` | Search every account, through the local index |
 | `get_thread(message_id, limit)` | The whole conversation a message belongs to |
 | `index_status()` | What the index holds and how old it is |
 | `sync_index()` | Bring the index up to date |
@@ -265,6 +265,15 @@ recipients, body and attachment names are all indexed. FTS5 syntax works —
 `subject: invoice`, `AND` / `OR` / `NOT`, `"exact phrase"`, `NEAR(one two, 5)`.
 A query that is not valid FTS5 (`invoice 12/2025`) is reinterpreted word by
 word, which the answer reports in `interpreted_as`.
+
+Results are ranked by relevance by default (`sort="relevance"`): weighted bm25
+with a subject match counting most, then sender, attachment names, and
+recipients/body, times a moderate recency bonus (up to +30 % for a mail received
+today, +15 % at one year old; a strong old match still beats a weak recent one).
+`sort="date"` returns the newest matches first instead. The weights and the
+bonus are constants at the top of `mail_search.py`. The command-line
+`python3 mail_index.py --search QUERY` ranks the same way, `--sort date` to
+order by date.
 
 `get_thread` uses the conversation grouping Mail computes itself, carried in the
 index. The whole exchange comes back, including replies filed in another mailbox

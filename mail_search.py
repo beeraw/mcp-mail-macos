@@ -26,6 +26,21 @@ INDEX_PATH = config.get("index_path")
 BULK_MAILBOXES = ("[Gmail]/Tous les messages", "[Gmail]/All Mail", "[Gmail]/Important")
 
 
+# Ranking. The FTS5 columns are (subject, sender, recipients, attachments, body);
+# bm25() takes one weight per column, in that order. A word in the subject says
+# what a mail is about, in the sender it says who wrote it, in an attachment name
+# it says what was sent; recipients and body match far more loosely.
+BM25_WEIGHTS = (10.0, 5.0, 1.0, 3.0, 1.0)
+# Recency bonus, applied as a multiplier on the (negative) bm25 score:
+#   score = bm25 * (1 + RECENCY_BOOST / (1 + age_days / RECENCY_HALF_LIFE_DAYS))
+# A mail received today gets its score boosted by 30 %, one a year old by 15 %,
+# so between two equally good matches the newer wins, but a strong old match
+# (score several times larger) still beats a weak recent one.
+RECENCY_BOOST = 0.3
+RECENCY_HALF_LIFE_DAYS = 365.0
+SORT_MODES = ("relevance", "date")
+
+
 def _connect() -> sqlite3.Connection:
     if not os.path.isfile(INDEX_PATH):
         raise MailError(
@@ -160,8 +175,19 @@ def search_all(
     until: str | None = None,
     limit: int = 20,
     max_age_minutes: float = config.get("index_max_age_minutes"),
+    sort: str = "relevance",
 ) -> dict[str, Any]:
-    """Searches every indexed message, across all accounts."""
+    """Searches every indexed message, across all accounts.
+
+    sort="relevance" (default) orders by weighted bm25 with a moderate recency
+    bonus; sort="date" orders newest first.
+    """
+    if sort not in SORT_MODES:
+        raise MailError(
+            "invalid_sort",
+            f"Unknown sort: {sort!r}.",
+            'Use "relevance" or "date".',
+        )
     if not query.strip():
         raise MailError("empty_query", "The query is empty.")
     limit = max(1, min(int(limit), 200))
@@ -194,21 +220,34 @@ def search_all(
             conditions.append("EXISTS (SELECT 1 FROM locations l WHERE l.message = m.id"
                               " AND l.flagged = 1)")
 
+        if sort == "date":
+            order = "m.date_received DESC"
+            order_parameters: list[Any] = []
+        else:
+            weights = ", ".join(str(weight) for weight in BM25_WEIGHTS)
+            # bm25() is negative, the more negative the better, so a positive
+            # multiplier above 1 improves a match. Ties fall back to newest.
+            order = (
+                f"bm25(messages_fts, {weights})"
+                " * (1 + ? / (1 + max(? - coalesce(m.date_received, 0), 0) / 86400.0 / ?)),"
+                " m.date_received DESC"
+            )
+            order_parameters = [RECENCY_BOOST, int(time.time()), RECENCY_HALF_LIFE_DAYS]
         statement = (
             "SELECT m.id, m.account, m.subject, m.sender, m.date_received, m.rfc_id"
             "  FROM messages_fts f JOIN messages m ON m.id = f.rowid"
             f" WHERE {' AND '.join(conditions)}"
-            " ORDER BY m.date_received DESC LIMIT ?"
+            f" ORDER BY {order} LIMIT ?"
         )
         used_query = query
         try:
-            rows = connection.execute(statement, (*parameters, limit)).fetchall()
+            rows = connection.execute(statement, (*parameters, *order_parameters, limit)).fetchall()
         except sqlite3.OperationalError:
             # The query was not valid FTS5 syntax; retry with the words quoted.
             used_query = _quote_terms(query)
             parameters[0] = used_query
             try:
-                rows = connection.execute(statement, (*parameters, limit)).fetchall()
+                rows = connection.execute(statement, (*parameters, *order_parameters, limit)).fetchall()
             except sqlite3.OperationalError as error:
                 raise MailError("invalid_query", f"Unusable query: {error}") from error
 
@@ -252,6 +291,7 @@ def search_all(
         result: dict[str, Any] = {
             "ok": True,
             "query": query,
+            "sort": sort,
             "messages": messages,
             "indexed_messages": connection.execute(
                 "SELECT count(*) FROM messages"
