@@ -37,7 +37,7 @@ import tempfile
 import time
 import unicodedata
 import urllib.parse
-from typing import Any, Iterator
+from typing import Any, Iterator, NamedTuple
 
 import config
 
@@ -384,15 +384,37 @@ def _plain_is_unusable(plain_text: str) -> bool:
     return len(stripped) < PLAIN_PLACEHOLDER_MAX_CHARS and bool(_PLAIN_PLACEHOLDER.search(stripped))
 
 
+class Extracted(NamedTuple):
+    rfc_id: str
+    body: str
+    legacy_had_body: bool  # whether the pre-fallback logic would have found a body
+    list_id: str  # normalized List-Id, '' when absent
+    unsubscribe: bool  # a List-Unsubscribe header is present
+
+
+_NOTHING = Extracted("", "", False, "", False)
+
+
 def _extract(path: str) -> tuple[str, str, bool]:
     """(rfc id, body text, whether the pre-fallback logic would have found a body)."""
+    found = extract_message(path)
+    return found.rfc_id, found.body, found.legacy_had_body
+
+
+def extract_message(path: str) -> Extracted:
+    """Everything the index takes from one .emlx: body, message id and bulk markers."""
     raw = read_raw_message(path)
     if raw is None:
-        return "", "", False
+        return _NOTHING
     try:
         message = email.message_from_bytes(raw, policy=email.policy.default)
     except Exception:  # noqa: BLE001 - a malformed message still has a file
-        return "", "", False
+        return _NOTHING
+    try:
+        list_id = normalize_list_id(str(message.get("list-id") or ""))
+        unsubscribe = bool(message.get("list-unsubscribe"))
+    except Exception:  # noqa: BLE001 - a malformed header must not lose the body
+        list_id, unsubscribe = "", False
 
     rfc_id = (message.get("message-id") or "").strip().strip("<>")
     plain: list[str] = []
@@ -425,7 +447,7 @@ def _extract(path: str) -> tuple[str, str, bool]:
             len(plain_text.strip()) >= PLAIN_MIN_CHARS and has_body(rendered)
         ):
             body = rendered
-    return rfc_id, body[:BODY_LIMIT], has_body(legacy[:BODY_LIMIT])
+    return Extracted(rfc_id, body[:BODY_LIMIT], has_body(legacy[:BODY_LIMIT]), list_id, unsubscribe)
 
 
 def extract_text(path: str) -> tuple[str, str]:
@@ -475,17 +497,74 @@ def message_rows(envelope: sqlite3.Connection) -> Iterator[sqlite3.Row]:
     )
 
 
-def recipients_by_message(envelope: sqlite3.Connection) -> dict[int, str]:
-    result: dict[int, list[str]] = {}
+# recipients.type in Mail's Envelope Index: 0 is To, 1 is Cc. No other value
+# occurs (a Bcc is never in a received message); anything unknown is skipped
+# rather than filed under the wrong header.
+RECIPIENT_TYPES = {0: "to", 1: "cc"}
+
+
+def recipients_by_message(envelope: sqlite3.Connection) -> dict[int, list[tuple[str, str, str]]]:
+    """Recipients per message as (kind, lower-cased address, display name), in header order."""
+    result: dict[int, list[tuple[str, str, str]]] = {}
     for row in envelope.execute(
-        "SELECT r.message, a.address, a.comment FROM recipients r"
+        "SELECT r.message, r.type, a.address, a.comment FROM recipients r"
         "  JOIN addresses a ON a.ROWID = r.address"
+        " ORDER BY r.message, r.type, r.position"
     ):
-        entry = row["address"] or ""
-        if row["comment"]:
-            entry = f"{row['comment']} {entry}"
-        result.setdefault(row["message"], []).append(entry)
-    return {key: " ".join(value) for key, value in result.items()}
+        kind = RECIPIENT_TYPES.get(row["type"])
+        if kind is None:
+            continue
+        result.setdefault(row["message"], []).append(
+            (kind, (row["address"] or "").strip().lower(), (row["comment"] or "").strip())
+        )
+    return result
+
+
+def recipient_text(recipients: list[tuple[str, str, str]], kind: str) -> str:
+    """The searchable text of one recipient kind: display names and addresses."""
+    return " ".join(
+        f"{name} {address}".strip() for entry_kind, address, name in recipients if entry_kind == kind
+    )
+
+
+def address_domain(address: str) -> str:
+    return address.rpartition("@")[2] if "@" in address else ""
+
+
+def normalize_list_id(value: str | None) -> str:
+    """The identifier inside <...> of a List-Id header, lower-cased; '' when absent.
+
+    The text before the brackets is a free-form description, so only the part in
+    brackets identifies the list. A bare value without brackets is taken as is.
+    """
+    if not value:
+        return ""
+    text = str(value).strip()
+    match = re.search(r"<([^<>]*)>", text)
+    return (match.group(1) if match else text).strip().lower()
+
+
+def attachment_flags(envelope: sqlite3.Connection) -> set[int]:
+    """Messages Mail records at least one real attachment for.
+
+    The Envelope Index is the reliable source, including for .partial.emlx
+    files whose attachments are stored apart from the message file. It also
+    lists inline images, mostly signature logos, so a name only counts when it
+    is not a png/gif/bmp/svg and not a client-generated inline name (image001,
+    outlook-*, att0*). jpg/jpeg/heic stay: those are usually real photos.
+    """
+    return {
+        row[0]
+        for row in envelope.execute(
+            "SELECT DISTINCT message FROM attachments"
+            " WHERE name IS NOT NULL"
+            "   AND lower(name) NOT GLOB '*.png' AND lower(name) NOT GLOB '*.gif'"
+            "   AND lower(name) NOT GLOB '*.bmp' AND lower(name) NOT GLOB '*.svg'"
+            "   AND lower(name) NOT GLOB 'image[0-9]*'"
+            "   AND lower(name) NOT GLOB 'outlook-*'"
+            "   AND lower(name) NOT GLOB 'att0*'"
+        )
+    }
 
 
 def attachments_by_message(envelope: sqlite3.Connection) -> dict[int, str]:
@@ -597,10 +676,27 @@ CREATE TABLE IF NOT EXISTS messages (
     size              INTEGER,
     conversation_id   INTEGER,
     indexed_at        INTEGER NOT NULL,
-    body_indexed      INTEGER NOT NULL DEFAULT 0   -- 1 when a non-trivial body was extracted
+    body_indexed      INTEGER NOT NULL DEFAULT 0,  -- 1 when a non-trivial body was extracted
+    has_attachment    INTEGER NOT NULL DEFAULT 0,  -- Mail records an attachment for it
+    list_id           TEXT,                        -- List-Id, inside <...>, lower-cased
+    is_bulk           INTEGER NOT NULL DEFAULT 0   -- 1 when List-Id or List-Unsubscribe is present
 );
 CREATE INDEX IF NOT EXISTS messages_rfc ON messages(rfc_id);
 CREATE INDEX IF NOT EXISTS messages_date ON messages(date_received);
+CREATE INDEX IF NOT EXISTS messages_list_id ON messages(list_id);
+
+-- Exact and domain filters (to:, cc:) run here; the FTS columns serve free-text
+-- search. Addresses are lower-cased, domain is the part after the last @.
+CREATE TABLE IF NOT EXISTS recipients (
+    message   INTEGER NOT NULL,
+    kind      TEXT NOT NULL,           -- 'to' or 'cc'
+    address   TEXT NOT NULL,
+    domain    TEXT NOT NULL,
+    name      TEXT
+);
+CREATE INDEX IF NOT EXISTS recipients_message ON recipients(message);
+CREATE INDEX IF NOT EXISTS recipients_address ON recipients(address, kind);
+CREATE INDEX IF NOT EXISTS recipients_domain ON recipients(domain, kind);
 
 CREATE TABLE IF NOT EXISTS locations (
     message   INTEGER NOT NULL,
@@ -615,7 +711,7 @@ CREATE INDEX IF NOT EXISTS locations_mailbox ON locations(account, mailbox);
 -- Indexed but not stored: the body is searchable, never kept. A hit returns a
 -- reference and the message itself is re-read from Mail on demand.
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
-    subject, sender, recipients, attachments, body,
+    subject, sender, "to", cc, attachments, body,
     content='', contentless_delete=1
 );
 
@@ -626,7 +722,9 @@ CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 # Bumped whenever a change to the tables or to what gets indexed means an
 # existing index must be rebuilt. An index with no version is version 1.
 #   2: messages.body_indexed, HTML fallback for empty text/plain parts
-SCHEMA_VERSION = 2
+#   3: To and Cc kept apart (FTS columns and a recipients table), has_attachment,
+#      list_id and is_bulk
+SCHEMA_VERSION = 3
 
 
 class IndexSchemaError(Exception):
@@ -809,6 +907,7 @@ def build(
     where = membership(envelope)
     recipients = recipients_by_message(envelope)
     attachments = attachments_by_message(envelope)
+    with_attachment = attachment_flags(envelope)
     rows = list(message_rows(envelope))
     print(f"  {len(rows)} messages")
 
@@ -836,7 +935,8 @@ def build(
         account = account_names.get(account_uuid, account_uuid)
 
         path = files.get(identifier)
-        rfc_id, body, legacy_had_body = _extract(path) if path else ("", "", False)
+        found = extract_message(path) if path else _NOTHING
+        rfc_id, body, legacy_had_body = found.rfc_id, found.body, found.legacy_had_body
         if path is None:
             missing_file += 1
         body_indexed = has_body(body)
@@ -845,14 +945,16 @@ def build(
         elif not legacy_had_body:
             recovered += 1
 
+        message_recipients = recipients.get(identifier, [])
         sender = row["sender"] or ""
         if row["sender_name"]:
             sender = f"{row['sender_name']} <{sender}>"
 
         index.execute(
             "INSERT OR REPLACE INTO messages"
-            " (id, account, rfc_id, subject, sender, date_received, size, conversation_id, indexed_at, body_indexed)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?)",
+            " (id, account, rfc_id, subject, sender, date_received, size, conversation_id, indexed_at,"
+            "  body_indexed, has_attachment, list_id, is_bulk)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 identifier,
                 account,
@@ -864,7 +966,18 @@ def build(
                 row["conversation_id"],
                 int(started),
                 int(body_indexed),
+                int(identifier in with_attachment),
+                found.list_id or None,
+                int(bool(found.list_id or found.unsubscribe)),
             ),
+        )
+        index.execute("DELETE FROM recipients WHERE message = ?", (identifier,))
+        index.executemany(
+            "INSERT INTO recipients (message, kind, address, domain, name) VALUES (?,?,?,?,?)",
+            [
+                (identifier, kind, address, address_domain(address), name)
+                for kind, address, name in message_recipients
+            ],
         )
         index.execute("DELETE FROM locations WHERE message = ?", (identifier,))
         for mailbox_id in mailbox_ids:
@@ -884,13 +997,14 @@ def build(
             )
         index.execute("DELETE FROM messages_fts WHERE rowid = ?", (identifier,))
         index.execute(
-            "INSERT INTO messages_fts (rowid, subject, sender, recipients, attachments, body)"
-            " VALUES (?,?,?,?,?,?)",
+            'INSERT INTO messages_fts (rowid, subject, sender, "to", cc, attachments, body)'
+            " VALUES (?,?,?,?,?,?,?)",
             (
                 identifier,
                 row["subject"] or "",
                 sender,
-                recipients.get(identifier, ""),
+                recipient_text(message_recipients, "to"),
+                recipient_text(message_recipients, "cc"),
                 attachments.get(identifier, ""),
                 body,
             ),
@@ -1028,6 +1142,7 @@ def sync(
     for identifier in gone:
         index.execute("DELETE FROM messages WHERE id = ?", (identifier,))
         index.execute("DELETE FROM locations WHERE message = ?", (identifier,))
+        index.execute("DELETE FROM recipients WHERE message = ?", (identifier,))
         index.execute("DELETE FROM messages_fts WHERE rowid = ?", (identifier,))
     index.commit()
     print(f"removed {len(gone)} messages that Mail no longer lists")

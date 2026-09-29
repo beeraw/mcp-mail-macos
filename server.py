@@ -116,12 +116,14 @@ def search_all(
     interface thread. The index is built by mail_index.py; if it is missing or
     stale, index_status says so and sync_index refreshes it.
 
-    Subject, sender, recipients, body and attachment names are all searched.
-    Words can be restricted to one field with "subject: facture", combined with
+    Subject, sender, To and Cc recipients, body and attachment names are all searched.
+    Words can be restricted to one field (subject, sender, to, cc, attachments,
+    body) with "subject: facture", "to: jane" or "cc: example.org"; "recipients:"
+    searches To and Cc together. Combine with
     AND / OR / NOT, and quoted for an exact phrase.
 
     Results come best match first by default: a word in the subject counts
-    most, then the sender, attachment names, and finally recipients and body,
+    most, then the sender, attachment names, and finally To/Cc and body,
     with a moderate bonus for recent mail. Use sort="date" when you want the
     latest messages matching a query rather than the best ones.
 
@@ -139,6 +141,9 @@ def search_all(
             the first matched word (start of the body if the word is only in
             the subject or sender; null if the message file is unavailable).
             Lets you judge a result without opening it; pass false to skip.
+
+    Each result also says whether it has an attachment ("has_attachment") and
+    whether it looks like a mailing list or newsletter ("is_bulk").
     """
     return _guard(
         mail_search.search_all,

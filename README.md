@@ -261,16 +261,19 @@ in `launchd/com.mcp-mail-macos.sync.plist` before installing it.
 | `sync_index()` | Bring the index up to date |
 
 `search_all` covers the whole archive in milliseconds. Subject, sender,
-recipients, body and attachment names are all indexed. FTS5 syntax works —
-`subject: invoice`, `AND` / `OR` / `NOT`, `"exact phrase"`, `NEAR(one two, 5)`.
+To and Cc recipients, body and attachment names are all indexed. FTS5 syntax
+works — `subject: invoice`, `to: jane`, `cc: example.org` (`recipients:` searches
+To and Cc together), `AND` / `OR` / `NOT`, `"exact phrase"`, `NEAR(one two, 5)`.
 A query that is not valid FTS5 (`invoice 12/2025`) is reinterpreted word by
 word, which the answer reports in `interpreted_as`.
 
 Results are ranked by relevance by default (`sort="relevance"`): weighted bm25
 with a subject match counting most, then sender, attachment names, and
-recipients/body, times a moderate recency bonus (up to +30 % for a mail received
+To/Cc/body, times a moderate recency bonus (up to +30 % for a mail received
 today, +15 % at one year old; a strong old match still beats a weak recent one).
-Each result carries a `snippet` (`snippets=false` to skip): about 200
+Each result carries `has_attachment` (a real attachment: inline logos and
+png/gif/bmp/svg names are ignored) and `is_bulk` (a List-Id or List-Unsubscribe
+header: mailing lists and newsletters), and a `snippet` (`snippets=false` to skip): about 200
 characters of the body around the first matched word, matched like the index
 does (case and accents ignored, `term*` prefixes and quoted phrases handled), or
 the start of the body when the word is only in the subject, sender or an
@@ -435,9 +438,11 @@ sender, date, `Message-ID`, locations. Reading a message goes back through
 `get_message`. For roughly 50,000 messages the index weighs about 80 MB.
 
 ```
-messages    (id, account, rfc_id, subject, sender, date_received, size, conversation_id, body_indexed)
+messages    (id, account, rfc_id, subject, sender, date_received, size, conversation_id,
+             body_indexed, has_attachment, list_id, is_bulk)
 locations   (message, account, mailbox, read, flagged)
-messages_fts(subject, sender, recipients, attachments, body)   -- FTS5, content=''
+recipients  (message, kind, address, domain, name)   -- kind is 'to' or 'cc', address lower-cased
+messages_fts(subject, sender, "to", cc, attachments, body)   -- FTS5, content=''
 ```
 
 Splitting message from locations absorbs Gmail's duplication: a message exists
@@ -486,7 +491,8 @@ The index carries a `schema_version` in its `meta` table (an index that
 predates versioning counts as version 1). When the code expects a newer one,
 `search_all`, `sync_index` and `mail_index.py --sync` refuse with an
 `index_outdated` error and the hint to run `python3 mail_index.py --build`;
-they never mix formats. `--build` always starts from scratch, writing to
+they never mix formats. Version 3 (To and Cc kept apart, `has_attachment`,
+`list_id`, `is_bulk`) needs a rebuild from version 2. `--build` always starts from scratch, writing to
 `<index>.building` and swapping the finished file in atomically, so the live
 index keeps answering until the new one is ready and a crashed build loses
 nothing. `--sync`, `--build` and the automatic sync share one lock file

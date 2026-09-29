@@ -1001,9 +1001,9 @@ class _FictionalIndexMixin:
                 (identifier, subject, sender, None if age is None else now - age * self.DAY, now),
             )
             index.execute(
-                "INSERT INTO messages_fts (rowid, subject, sender, recipients, attachments, body)"
-                " VALUES (?, ?, ?, ?, ?, ?)",
-                (identifier, subject, sender, recipients, attachments, body),
+                'INSERT INTO messages_fts (rowid, subject, sender, "to", cc, attachments, body)'
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (identifier, subject, sender, recipients, "", attachments, body),
             )
             index.execute(
                 "INSERT INTO locations (message, account, mailbox, read, flagged)"
@@ -1723,6 +1723,164 @@ class SchemaVersionTests(unittest.TestCase):
         self.assertFalse(os.path.exists(self.path + "-wal"))
         self.assertFalse(os.path.exists(self.path + "-shm"))
         self.assertFalse(os.path.exists(self.path + ".building"))
+
+
+class MetadataV3Tests(unittest.TestCase):
+    """To/Cc split, List-Id, attachments and the schema v3 refusal."""
+
+    def envelope(self):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.executescript(
+            "CREATE TABLE addresses (address TEXT, comment TEXT);"
+            "CREATE TABLE recipients (message INTEGER, address INTEGER, type INTEGER, position INTEGER);"
+            "CREATE TABLE attachments (message INTEGER, attachment_id TEXT, name TEXT);"
+        )
+        connection.executemany(
+            "INSERT INTO addresses (ROWID, address, comment) VALUES (?, ?, ?)",
+            [(1, "Jane@Example.com", "Jane Doe"), (2, "john@example.org", ""), (3, "team@example.net", "Team")],
+        )
+        connection.executemany(
+            "INSERT INTO recipients (message, address, type, position) VALUES (?, ?, ?, ?)",
+            [(10, 2, 1, 0), (10, 1, 0, 0), (10, 3, 1, 1), (11, 2, 0, 0), (12, 1, 2, 0)],
+        )
+        connection.executemany(
+            "INSERT INTO attachments (message, attachment_id, name) VALUES (?, ?, ?)",
+            [(10, "1.2", "plan.pdf"), (10, "1.3", "logo.png"), (11, "1.2", None)],
+        )
+        return connection
+
+    def test_recipient_types_are_split_and_normalized(self):
+        found = mail_index.recipients_by_message(self.envelope())
+        self.assertEqual(
+            found[10],
+            [
+                ("to", "jane@example.com", "Jane Doe"),
+                ("cc", "john@example.org", ""),
+                ("cc", "team@example.net", "Team"),
+            ],
+        )
+        self.assertEqual(mail_index.recipient_text(found[10], "to"), "Jane Doe jane@example.com")
+        self.assertEqual(
+            mail_index.recipient_text(found[10], "cc"), "john@example.org Team team@example.net"
+        )
+        self.assertNotIn(12, found)  # unknown type: skipped, not misfiled
+
+    def test_address_domain(self):
+        self.assertEqual(mail_index.address_domain("jane@example.com"), "example.com")
+        self.assertEqual(mail_index.address_domain("undisclosed"), "")
+
+    def test_list_id_is_normalized(self):
+        normalize = mail_index.normalize_list_id
+        self.assertEqual(normalize("Example News <News.Example.COM>"), "news.example.com")
+        self.assertEqual(normalize("<list.example.org>"), "list.example.org")
+        self.assertEqual(normalize("bare.example.org"), "bare.example.org")
+        self.assertEqual(normalize(None), "")
+        self.assertEqual(normalize("  "), "")
+
+    def test_has_attachment_comes_from_the_envelope(self):
+        # message 10 has a real pdf next to a logo; 11 has only an unnamed part
+        self.assertEqual(mail_index.attachment_flags(self.envelope()), {10})
+
+    def test_inline_logos_do_not_count_as_attachments(self):
+        connection = self.envelope()
+        connection.execute("DELETE FROM attachments")
+        names = {
+            20: ["Logo.PNG", "sig.gif", "banner.svg", "scan.bmp"],
+            21: ["image001.jpg", "Outlook-abc.jpg", "ATT00001.jpg"],
+            22: ["logo.png", "holiday.JPG"],
+            23: ["photo.heic", "notes.txt"],
+        }
+        connection.executemany(
+            "INSERT INTO attachments (message, attachment_id, name) VALUES (?, '1', ?)",
+            [(message, name) for message, values in names.items() for name in values],
+        )
+        self.assertEqual(mail_index.attachment_flags(connection), {22, 23})
+
+    def test_recipients_column_filter_is_rewritten_to_to_and_cc(self):
+        rewrite = mail_search._legacy_column_filters
+        self.assertEqual(rewrite("recipients: jane"), "{to cc}: jane")
+        self.assertEqual(rewrite("plan AND Recipients:jane"), "plan AND {to cc}:jane")
+        self.assertEqual(rewrite("cc: jane"), "cc: jane")
+        self.assertEqual(rewrite('"recipients: jane"'), '"recipients: jane"')
+
+    def test_message_headers_mark_bulk_mail(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+
+        def emlx(headers: str) -> str:
+            raw = (headers + "Subject: Hi\n\nBody text here\n").replace("\n", "\r\n").encode()
+            path = os.path.join(directory.name, f"{len(os.listdir(directory.name))}.emlx")
+            with open(path, "wb") as handle:
+                handle.write(str(len(raw)).encode() + b"\n" + raw)
+            return path
+
+        listed = mail_index.extract_message(emlx("List-Id: Weekly <Weekly.Example.org>\n"))
+        self.assertEqual((listed.list_id, listed.unsubscribe), ("weekly.example.org", False))
+        unsub = mail_index.extract_message(emlx("List-Unsubscribe: <mailto:u@example.org>\n"))
+        self.assertEqual((unsub.list_id, unsub.unsubscribe), ("", True))
+        plain = mail_index.extract_message(emlx(""))
+        self.assertEqual((plain.list_id, plain.unsubscribe), ("", False))
+        self.assertEqual(mail_index.extract_message(os.path.join(directory.name, "no.emlx")).body, "")
+
+    def test_schema_is_version_three_and_refuses_version_two(self):
+        self.assertEqual(mail_index.SCHEMA_VERSION, 3)
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = os.path.join(directory.name, "index.sqlite")
+        old = sqlite3.connect(path)
+        old.executescript(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY);"
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);"
+            "INSERT INTO meta VALUES ('schema_version', '2');"
+        )
+        old.close()
+        with self.assertRaises(mail_index.IndexSchemaError) as caught:
+            mail_index.open_index(path)
+        self.assertEqual((caught.exception.found, caught.exception.expected), (2, 3))
+
+    def test_bm25_weights_match_the_fts_columns(self):
+        index = sqlite3.connect(":memory:")
+        index.executescript(mail_index.SCHEMA)
+        columns = [row[1] for row in index.execute("PRAGMA table_info(messages_fts)")]
+        self.assertEqual(len(mail_search.BM25_WEIGHTS), len(columns))
+        self.assertEqual(columns[:4], ["subject", "sender", "to", "cc"])
+
+    def test_cc_column_search_and_result_flags(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = os.path.join(directory.name, "index.sqlite")
+        index = mail_index.open_index(path)
+        for identifier, cc, attached, bulk in ((1, "carol@example.org", 1, 0), (2, "", 0, 1)):
+            index.execute(
+                "INSERT INTO messages (id, account, subject, sender, date_received, indexed_at,"
+                " has_attachment, is_bulk) VALUES (?, 'Work', 'Plan', 'jane@example.com', ?, ?, ?, ?)",
+                (identifier, int(time.time()), int(time.time()), attached, bulk),
+            )
+            index.execute(
+                'INSERT INTO messages_fts (rowid, subject, sender, "to", cc, attachments, body)'
+                " VALUES (?, 'Plan', 'jane@example.com', 'bob@example.com', ?, '', 'text')",
+                (identifier, cc),
+            )
+            index.execute(
+                "INSERT INTO locations (message, account, mailbox, read, flagged)"
+                " VALUES (?, 'Work', 'INBOX', 1, 0)",
+                (identifier,),
+            )
+        index.commit()
+        index.close()
+        with mock.patch.object(mail_search, "INDEX_PATH", path), mock.patch.object(
+            mail_index, "find_store", side_effect=FileNotFoundError
+        ):
+            found = mail_search.search_all("cc: carol", max_age_minutes=10**9)
+            self.assertEqual([m["mail_id"] for m in found["messages"]], [1])
+            self.assertTrue(found["messages"][0]["has_attachment"])
+            self.assertFalse(found["messages"][0]["is_bulk"])
+            legacy = mail_search.search_all("recipients: carol", max_age_minutes=10**9)
+            self.assertEqual([m["mail_id"] for m in legacy["messages"]], [1])
+            self.assertNotIn("interpreted_as", legacy)
+            both = mail_search.search_all("plan", max_age_minutes=10**9)["messages"]
+            self.assertEqual({m["mail_id"]: m["is_bulk"] for m in both}, {1: False, 2: True})
 
 
 class IndexStatusCoverageTests(_FictionalIndexMixin, unittest.TestCase):

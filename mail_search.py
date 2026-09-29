@@ -26,11 +26,11 @@ INDEX_PATH = config.get("index_path")
 BULK_MAILBOXES = ("[Gmail]/Tous les messages", "[Gmail]/All Mail", "[Gmail]/Important")
 
 
-# Ranking. The FTS5 columns are (subject, sender, recipients, attachments, body);
+# Ranking. The FTS5 columns are (subject, sender, to, cc, attachments, body);
 # bm25() takes one weight per column, in that order. A word in the subject says
 # what a mail is about, in the sender it says who wrote it, in an attachment name
-# it says what was sent; recipients and body match far more loosely.
-BM25_WEIGHTS = (10.0, 5.0, 1.0, 3.0, 1.0)
+# it says what was sent; To/Cc and body match far more loosely.
+BM25_WEIGHTS = (10.0, 5.0, 1.0, 1.0, 3.0, 1.0)
 # Recency bonus, applied as a multiplier on the (negative) bm25 score:
 #   score = bm25 * (1 + RECENCY_BOOST / (1 + age_days / RECENCY_HALF_LIFE_DAYS))
 # A mail received today gets its score boosted by 30 %, one a year old by 15 %,
@@ -107,6 +107,15 @@ def _quote_terms(query: str) -> str:
     """
     terms = [term for term in re.split(r"\s+", query.strip()) if term]
     return " AND ".join('"' + term.replace('"', "") + '"' for term in terms)
+
+
+def _legacy_column_filters(query: str) -> str:
+    """Rewrites the old `recipients:` column filter to the To and Cc columns.
+
+    The FTS column `recipients` was split into `to` and `cc` (schema v3); FTS5
+    accepts a column set, `{to cc}: word`, which keeps old queries working.
+    """
+    return re.sub(r"(?<![\w\"])recipients\s*:", "{to cc}:", query, flags=re.IGNORECASE)
 
 
 def _index_age_minutes() -> float | None:
@@ -244,6 +253,7 @@ def search_all(
     connection = _connect()
     try:
         conditions = ["messages_fts MATCH ?"]
+        query = _legacy_column_filters(query)
         parameters: list[Any] = [query]
         if since_ts:
             conditions.append("m.date_received >= ?")
@@ -280,7 +290,8 @@ def search_all(
             )
             order_parameters = [RECENCY_BOOST, int(time.time()), RECENCY_HALF_LIFE_DAYS]
         statement = (
-            "SELECT m.id, m.account, m.subject, m.sender, m.date_received, m.rfc_id"
+            "SELECT m.id, m.account, m.subject, m.sender, m.date_received, m.rfc_id,"
+            "       m.has_attachment, m.is_bulk"
             "  FROM messages_fts f JOIN messages m ON m.id = f.rowid"
             f" WHERE {' AND '.join(conditions)}"
             f" ORDER BY {order} LIMIT ?"
@@ -332,6 +343,8 @@ def search_all(
                     "read": bool(chosen["read"]),
                     "flagged": bool(chosen["flagged"]),
                     "rfc_message_id": row["rfc_id"] or "",
+                    "has_attachment": bool(row["has_attachment"]),
+                    "is_bulk": bool(row["is_bulk"]),
                 }
             )
             if snippets:
