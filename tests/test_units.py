@@ -33,6 +33,7 @@ import mail_files
 import mail_imap
 import mail_index
 import mail_message
+import mail_operators
 import mail_search
 import mail_stem
 import mail_signature
@@ -1234,6 +1235,299 @@ class SearchSnippetTests(_FictionalIndexMixin, unittest.TestCase):
         self.assertIsNone(result["messages"][0]["snippet"])
 
 
+class OperatorParserTests(unittest.TestCase):
+    """mail_operators.parse: what is pulled out of a query and what is left."""
+
+    def parse(self, query):
+        return mail_operators.parse(query)
+
+    def test_a_query_without_operators_is_returned_untouched(self):
+        parsed = self.parse("invoice  12/2025 (a OR b)")
+        self.assertEqual(parsed.filters, [])
+        self.assertEqual(parsed.free_text, "invoice  12/2025 (a OR b)")
+
+    def test_every_operator_is_recognised(self):
+        query = (
+            "from:jane to:john cc:example.org has:attachment filename:plan.pdf larger:2M"
+            " smaller:10K older_than:1y newer_than:2w after:2026-01-05 before:2026/02/01"
+            " is:unread in:inbox"
+        )
+        parsed = self.parse(query)
+        self.assertEqual(parsed.free_text, "")
+        self.assertEqual(
+            [item.key for item in parsed.filters],
+            ["from", "to", "cc", "has", "filename", "larger", "smaller", "older_than",
+             "newer_than", "after", "before", "is", "in"],
+        )
+
+    def test_keys_are_case_insensitive_and_values_kept(self):
+        parsed = self.parse("FROM:Jane IS:Unread")
+        self.assertEqual([(i.key, i.value) for i in parsed.filters], [("from", "Jane"), ("is", "unread")])
+
+    def test_a_quoted_value_may_hold_spaces(self):
+        parsed = self.parse('from:"Jane Doe" invoice')
+        self.assertEqual(parsed.filters[0].value, "Jane Doe")
+        self.assertEqual(parsed.free_text, "invoice")
+
+    def test_a_leading_minus_negates(self):
+        parsed = self.parse("-is:bulk -from:example.net roadmap")
+        self.assertTrue(all(item.negated for item in parsed.filters))
+        self.assertEqual(parsed.free_text, "roadmap")
+
+    def test_free_text_keeps_its_fts_syntax(self):
+        parsed = self.parse('subject:roadmap from:jane "exact phrase" OR budget*')
+        self.assertEqual(parsed.free_text, 'subject:roadmap "exact phrase" OR budget*')
+
+    def test_an_operator_inside_a_quoted_phrase_is_text(self):
+        parsed = self.parse('"from:jane" budget')
+        self.assertEqual(parsed.filters, [])
+        self.assertEqual(parsed.free_text, '"from:jane" budget')
+
+    def test_a_space_after_the_colon_leaves_an_fts_column_filter(self):
+        parsed = self.parse("to: jane {to cc}:john cc: example.org")
+        self.assertEqual(parsed.filters, [])
+
+    def test_an_unknown_key_stays_free_text(self):
+        parsed = self.parse("label:work budget")
+        self.assertEqual(parsed.filters, [])
+        self.assertEqual(parsed.free_text, "label:work budget")
+
+    def test_a_connector_left_dangling_is_dropped(self):
+        self.assertEqual(self.parse("from:jane AND budget").free_text, "budget")
+        self.assertEqual(self.parse("budget AND from:jane AND plan").free_text, "budget AND plan")
+
+    def test_not_before_an_operator_negates_it(self):
+        parsed = self.parse("NOT from:example.com invoice")
+        self.assertEqual([(i.key, i.negated) for i in parsed.filters], [("from", True)])
+        self.assertEqual(parsed.free_text, "invoice")
+        self.assertEqual(self.parse("invoice NOT is:bulk").free_text, "invoice")
+        self.assertTrue(self.parse("invoice NOT is:bulk").filters[0].negated)
+
+    def test_parentheses_around_operators_only_are_dropped(self):
+        for query, text in (("(from:a) b", "b"), ("(from:a has:attachment) b", "b"),
+                            ("((from:a)) b", "b"), ("invoice AND (from:a)", "invoice")):
+            parsed = self.parse(query)
+            self.assertEqual(parsed.free_text, text, query)
+            self.assertTrue(parsed.filters)
+        self.assertEqual(self.parse("(a OR b) from:c").free_text, "(a OR b)")
+
+    def test_or_and_mixed_groups_next_to_an_operator_are_refused(self):
+        for query in ("from:a OR from:b", "word OR from:a", "from:a OR word",
+                      "(from:a OR from:b) invoice", "(from:a invoice)", "word OR (from:a)",
+                      "NOT (from:a)", "NOT -from:a", "-(from:a) b", "NOT NOT from:a"):
+            with self.assertRaises(MailError, msg=query) as caught:
+                self.parse(query)
+            self.assertEqual(caught.exception.code, "invalid_operator")
+            self.assertIn("AND", caught.exception.hint)
+
+    def test_parentheses_in_a_quoted_phrase_are_not_groups(self):
+        parsed = self.parse('"(x" from:a')
+        self.assertEqual(parsed.free_text, '"(x"')
+
+    def test_dates_are_normalised(self):
+        self.assertEqual(self.parse("after:2026/01/05").filters[0].value, "2026-01-05")
+
+    def test_from_me_is_normalised(self):
+        self.assertEqual(self.parse("to:ME").filters[0].value, "me")
+
+    def test_invalid_values_are_refused_with_a_hint(self):
+        for query in (
+            "after:yesterday", "before:2026-13-45", "larger:big", "smaller:5X",
+            "older_than:3", "newer_than:d", "has:pdf", "is:archived", 'from:""',
+        ):
+            with self.assertRaises(MailError, msg=query) as caught:
+                self.parse(query)
+            self.assertEqual(caught.exception.code, "invalid_operator")
+            self.assertTrue(caught.exception.hint)
+
+    def test_sizes_and_ages(self):
+        self.assertEqual(mail_operators._size_bytes("larger", "2M"), 2 * 1024**2)
+        self.assertEqual(mail_operators._size_bytes("larger", "500k"), 500 * 1024)
+        self.assertEqual(mail_operators._size_bytes("larger", "1234"), 1234)
+        self.assertEqual(mail_operators._age_seconds("older_than", "2w"), 14 * 86400)
+        self.assertEqual(mail_operators._age_seconds("older_than", "1y"), 365 * 86400)
+
+
+class SearchOperatorTests(unittest.TestCase):
+    """search_all with operators, on a throwaway index of fictional messages."""
+
+    DAY = 86400
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.path = os.path.join(self.directory.name, "index.sqlite")
+        index = mail_index.open_index(self.path)
+        self.now = int(time.time())
+        # id, subject, sender, to, cc, age days, size, attachment, bulk, [(mailbox, read, flagged)]
+        rows = [
+            (1, "Invoice March", "Jane Doe <jane@example.com>", ["john@example.org"], [], 10, 5000, 1, 0,
+             [("INBOX", 0, 0)]),
+            (2, "Invoice April", "Example Ltd <billing@example.net>", ["jane@example.com"],
+             ["john@example.org"], 400, 3 * 1024**2, 1, 0, [("[Work]/Archive", 1, 1)]),
+            (3, "Newsletter invoice", "news@shop.example.com", ["jane@example.com"], [], 5, 900, 0, 1,
+             [("INBOX", 1, 0), ("[Gmail]/All Mail", 0, 0)]),
+            (4, "Lunch", "john@example.org", ["jane@example.com", "kim@example.net"], ["me@example.com"], 60,
+             1200, 0, 0, [("Sent", 1, 0)]),
+        ]
+        for identifier, subject, sender, to, cc, age, size, attached, bulk, places in rows:
+            index.execute(
+                "INSERT INTO messages (id, account, subject, sender, date_received, size,"
+                " has_attachment, is_bulk, indexed_at) VALUES (?, 'Work', ?, ?, ?, ?, ?, ?, ?)",
+                (identifier, subject, sender, self.now - age * self.DAY, size, attached, bulk, self.now),
+            )
+            index.execute(
+                'INSERT INTO messages_fts (rowid, subject, sender, "to", cc, attachments, body,'
+                " subject_stem, attachments_stem, body_stem) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (identifier, subject, sender, " ".join(to), " ".join(cc),
+                 "plan.pdf" if identifier == 1 else ("budget-2026.xlsx" if identifier == 2 else ""),
+                 "some words", mail_stem.stem_text(subject),
+                 "plan pdf" if identifier == 1 else "", ""),
+            )
+            for kind, addresses in (("to", to), ("cc", cc)):
+                for address in addresses:
+                    index.execute(
+                        "INSERT INTO recipients (message, kind, address, domain, name)"
+                        " VALUES (?,?,?,?,?)",
+                        (identifier, kind, address, address.split("@")[1], None),
+                    )
+            for mailbox, read, flagged in places:
+                index.execute(
+                    "INSERT INTO locations (message, account, mailbox, read, flagged)"
+                    " VALUES (?, 'Work', ?, ?, ?)",
+                    (identifier, mailbox, read, flagged),
+                )
+        index.commit()
+        index.close()
+        for target, value in (
+            (mail_search, {"INDEX_PATH": self.path, "_OWN_ADDRESSES": ["me@example.com"]}),
+        ):
+            for name, replacement in value.items():
+                patcher = mock.patch.object(target, name, replacement)
+                patcher.start()
+                self.addCleanup(patcher.stop)
+        store = mock.patch.object(mail_index, "find_store", side_effect=FileNotFoundError)
+        store.start()
+        self.addCleanup(store.stop)
+
+    def ids(self, query, **kwargs):
+        result = mail_search.search_all(query, max_age_minutes=10**9, snippets=False, **kwargs)
+        return sorted(message["mail_id"] for message in result["messages"])
+
+    def test_from_an_address_a_domain_or_a_name(self):
+        self.assertEqual(self.ids("from:jane@example.com"), [1])
+        self.assertEqual(self.ids("from:@example.com"), [1, 3])
+        self.assertEqual(self.ids("from:example.net"), [2])
+        self.assertEqual(self.ids("from:jane"), [1])
+        self.assertEqual(self.ids('from:"jane doe"'), [1])
+        self.assertEqual(self.ids("from:@example.org"), [4])
+
+    def test_a_domain_does_not_match_a_longer_domain(self):
+        self.assertEqual(self.ids("from:@ample.com"), [])
+
+    def test_to_and_cc_use_the_recipients_table(self):
+        self.assertEqual(self.ids("to:jane@example.com"), [2, 3, 4])
+        self.assertEqual(self.ids("to:@example.net"), [4])
+        self.assertEqual(self.ids("cc:john"), [2])
+        self.assertEqual(self.ids("cc:@example.com"), [4])
+
+    def test_the_to_column_stays_searchable_with_a_space_or_braces(self):
+        self.assertEqual(self.ids("to: kim"), [4])
+        self.assertEqual(self.ids("{to}:kim"), [4])
+        self.assertEqual(self.ids("recipients:kim"), [4])
+
+    def test_me_means_the_addresses_of_the_accounts(self):
+        self.assertEqual(self.ids("cc:me"), [4])
+        self.assertEqual(self.ids("from:me"), [])
+        with mock.patch.object(mail_search, "_OWN_ADDRESSES", []):
+            with self.assertRaises(MailError) as caught:
+                self.ids("to:me")
+        self.assertEqual(caught.exception.code, "no_own_address")
+
+    def test_attachment_size_and_age(self):
+        self.assertEqual(self.ids("has:attachment"), [1, 2])
+        self.assertEqual(self.ids("-has:attachment"), [3, 4])
+        self.assertEqual(self.ids("larger:1M"), [2])
+        self.assertEqual(self.ids("smaller:1K"), [3])
+        self.assertEqual(self.ids("older_than:1y"), [2])
+        self.assertEqual(self.ids("newer_than:1w"), [3])
+
+    def test_dates_include_after_and_exclude_before(self):
+        day = time.strftime("%Y-%m-%d", time.localtime(self.now - 60 * self.DAY))
+        self.assertIn(4, self.ids(f"after:{day}"))
+        self.assertNotIn(4, self.ids(f"before:{day}"))
+        self.assertIn(4, self.ids(f"-before:{day}"))
+
+    def test_read_state_flag_and_bulk(self):
+        self.assertEqual(self.ids("is:unread"), [1, 3])
+        self.assertEqual(self.ids("is:read"), [2, 3, 4])
+        self.assertEqual(self.ids("-is:unread"), [2, 4])
+        self.assertEqual(self.ids("is:flagged"), [2])
+        self.assertEqual(self.ids("is:starred"), [2])
+        self.assertEqual(self.ids("is:bulk"), [3])
+        self.assertEqual(self.ids("-is:bulk"), [1, 2, 4])
+
+    def test_in_matches_a_mailbox_name_or_its_last_segment(self):
+        self.assertEqual(self.ids("in:inbox"), [1, 3])
+        self.assertEqual(self.ids("in:archive"), [2])
+        self.assertEqual(self.ids('in:"[Work]/Archive"'), [2])
+        self.assertEqual(self.ids("in:mail"), [])
+        self.assertEqual(self.ids("in:all mail"), [])
+
+    def test_filename_searches_the_attachment_names(self):
+        self.assertEqual(self.ids("filename:plan.pdf"), [1])
+        self.assertEqual(self.ids("filename:budget"), [2])
+        self.assertEqual(self.ids("-filename:plan.pdf invoice"), [2, 3])
+        self.assertEqual(self.ids("filename:pdf invoice"), [1])
+
+    def test_operators_combine_with_and_and_with_free_text(self):
+        self.assertEqual(self.ids("invoice from:@example.com"), [1, 3])
+        self.assertEqual(self.ids("invoice from:@example.com -is:bulk"), [1])
+        self.assertEqual(self.ids("from:jane from:example.com"), [1])
+        self.assertEqual(self.ids("invoice OR lunch -is:bulk in:inbox"), [1])
+
+    def test_keyword_parameters_still_combine(self):
+        self.assertEqual(self.ids("from:@example.com", unread_only=True), [1, 3])
+        self.assertEqual(self.ids("has:attachment", flagged_only=True), [2])
+        self.assertEqual(self.ids("has:attachment", mailbox="INBOX"), [1])
+
+    def test_an_operator_only_query_comes_back_newest_first(self):
+        result = mail_search.search_all("-is:bulk", max_age_minutes=10**9, snippets=False)
+        self.assertEqual([m["mail_id"] for m in result["messages"]], [1, 4, 2])
+        self.assertEqual(result["sort"], "date")
+
+    def test_not_and_grouped_operators_end_to_end(self):
+        self.assertEqual(self.ids("invoice NOT is:bulk"), [1, 2])
+        self.assertEqual(self.ids("NOT from:@example.com"), [2, 4])
+        self.assertEqual(self.ids("(from:@example.com) invoice"), [1, 3])
+        with self.assertRaises(MailError):
+            self.ids("from:jane OR from:john")
+
+    def test_the_answer_echoes_the_filters(self):
+        result = mail_search.search_all(
+            "invoice -is:bulk after:2020/01/02", max_age_minutes=10**9, snippets=False
+        )
+        self.assertEqual(result["filters"], {"-is": ["bulk"], "after": ["2020-01-02"]})
+        self.assertEqual(result["query"], "invoice")
+        self.assertEqual(result["original_query"], "invoice -is:bulk after:2020/01/02")
+        self.assertEqual(mail_search.search_all("invoice", max_age_minutes=10**9, snippets=False)["filters"], {})
+
+    def test_a_bad_value_is_refused_before_searching(self):
+        with self.assertRaises(MailError) as caught:
+            self.ids("invoice after:soon")
+        self.assertEqual(caught.exception.code, "invalid_operator")
+
+    def test_an_empty_query_is_still_refused(self):
+        with self.assertRaises(MailError) as caught:
+            self.ids("   ")
+        self.assertEqual(caught.exception.code, "empty_query")
+
+    def test_free_text_that_is_not_fts_is_still_retried_quoted(self):
+        result = mail_search.search_all("invoice ( from:jane", max_age_minutes=10**9, snippets=False)
+        self.assertIn("interpreted_as", result)
+        self.assertEqual(result["filters"], {"from": ["jane"]})
+
+
 class SearchEvaluationTests(unittest.TestCase):
     def test_reply_prefixes_stopwords_and_short_tokens_are_dropped(self):
         words = mail_eval.usable_words("RE: TR: Fwd: The quarterly budget for 2026 and near it")
@@ -2393,7 +2687,7 @@ class StemmedSearchTests(_FictionalIndexMixin, unittest.TestCase):
     def test_names_and_addresses_stay_exact(self):
         self.assertIn(11, self.ids("jane"))
         self.assertEqual(set(self.ids("sender:john")), {2, 12})
-        self.assertEqual(self.ids("to:bob"), [11])
+        self.assertEqual(self.ids("{to}:bob"), [11])
         self.assertEqual(self.ids("sender:factures"), [])
 
     def test_quotes_are_exact_and_prefix_and_columns_work(self):

@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import config
+import mail_operators
 import mail_stem
 from mail_tools import MailError, MessageReference
 
@@ -120,6 +121,26 @@ def _legacy_column_filters(query: str) -> str:
     accepts a column set, `{to cc}: word`, which keeps old queries working.
     """
     return re.sub(r"(?<![\w\"])recipients\s*:", "{to cc}:", query, flags=re.IGNORECASE)
+
+
+_OWN_ADDRESSES: list[str] | None = None
+
+
+def _own_addresses() -> list[str]:
+    """Addresses of the user's Mail accounts, for from:me / to:me.
+
+    Asked to Mail once per process (an AppleScript round trip) and cached: the
+    set of accounts hardly ever changes while the server runs. Only queries
+    that use `me` pay for it; a Mail that cannot answer fails that query alone.
+    """
+    global _OWN_ADDRESSES
+    if _OWN_ADDRESSES is None:
+        import mail_draft
+
+        _OWN_ADDRESSES = sorted(
+            {address for account in mail_draft.accounts() for address in account["addresses"]}
+        )
+    return _OWN_ADDRESSES
 
 
 def _index_age_minutes() -> float | None:
@@ -240,6 +261,11 @@ def search_all(
     bonus; sort="date" orders newest first. With snippets=True each result
     carries ~200 characters of its body around the first matched word, read
     from the .emlx on disk (the index is contentless and cannot supply them).
+
+    Gmail-style operators in the query (mail_operators) are parsed first and
+    become SQL filters; only the remaining free text goes to FTS5. A query made
+    of operators alone is allowed and comes back newest first. The answer's
+    "filters" shows how the query was understood.
     """
     if sort not in SORT_MODES:
         raise MailError(
@@ -247,7 +273,10 @@ def search_all(
             f"Unknown sort: {sort!r}.",
             'Use "relevance" or "date".',
         )
-    if not query.strip():
+    original_query = query
+    parsed = mail_operators.parse(query)
+    query = parsed.free_text
+    if not query.strip() and not parsed.filters:
         raise MailError("empty_query", "The query is empty.")
     limit = max(1, min(int(limit), 200))
     freshness = _refresh_if_stale(max_age_minutes)
@@ -256,9 +285,29 @@ def search_all(
 
     connection = _connect()
     try:
-        conditions = ["messages_fts MATCH ?"]
+        operator_conditions, operator_parameters, wanted_names, unwanted_names = (
+            mail_operators.build_conditions(parsed.filters, _own_addresses)
+        )
+        has_text = bool(query.strip())
         query = _legacy_column_filters(query)
-        parameters: list[Any] = [mail_stem.rewrite_query(query)]
+        name_clause = " AND ".join(mail_operators.filename_match(name) for name in wanted_names)
+
+        def match_expression(text: str) -> str:
+            parts = []
+            if has_text:
+                parts.append(f"({mail_stem.rewrite_query(text)})" if name_clause else mail_stem.rewrite_query(text))
+            if name_clause:
+                parts.append(name_clause)
+            return " AND ".join(parts)
+
+        use_fts = has_text or bool(wanted_names)
+        conditions: list[str] = ["messages_fts MATCH ?"] if use_fts else []
+        parameters: list[Any] = [match_expression(query)] if use_fts else []
+        for name in unwanted_names:
+            conditions.append("m.id NOT IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)")
+            parameters.append(mail_operators.filename_match(name))
+        conditions.extend(operator_conditions)
+        parameters.extend(operator_parameters)
         if since_ts:
             conditions.append("m.date_received >= ?")
             parameters.append(since_ts)
@@ -280,6 +329,8 @@ def search_all(
             conditions.append("EXISTS (SELECT 1 FROM locations l WHERE l.message = m.id"
                               " AND l.flagged = 1)")
 
+        if not has_text:
+            sort = "date"  # no free text, so nothing to rank by
         if sort == "date":
             order = "m.date_received DESC"
             order_parameters: list[Any] = []
@@ -293,20 +344,23 @@ def search_all(
                 " m.date_received DESC"
             )
             order_parameters = [RECENCY_BOOST, int(time.time()), RECENCY_HALF_LIFE_DAYS]
+        source = "messages_fts f JOIN messages m ON m.id = f.rowid" if use_fts else "messages m"
+        where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
         statement = (
             "SELECT m.id, m.account, m.subject, m.sender, m.date_received, m.rfc_id,"
             "       m.has_attachment, m.is_bulk"
-            "  FROM messages_fts f JOIN messages m ON m.id = f.rowid"
-            f" WHERE {' AND '.join(conditions)}"
+            f"  FROM {source}{where}"
             f" ORDER BY {order} LIMIT ?"
         )
         used_query = query
         try:
             rows = connection.execute(statement, (*parameters, *order_parameters, limit)).fetchall()
-        except sqlite3.OperationalError:
+        except sqlite3.OperationalError as error:
+            if not has_text:
+                raise MailError("invalid_query", f"Unusable query: {error}") from error
             # The query was not valid FTS5 syntax; retry with the words quoted.
             used_query = _quote_terms(query)
-            parameters[0] = mail_stem.rewrite_query(used_query)
+            parameters[0] = match_expression(used_query)
             try:
                 rows = connection.execute(statement, (*parameters, *order_parameters, limit)).fetchall()
             except sqlite3.OperationalError as error:
@@ -358,6 +412,7 @@ def search_all(
             "ok": True,
             "query": query,
             "sort": sort,
+            "filters": mail_operators.describe(parsed.filters),
             "messages": messages,
             "indexed_messages": connection.execute(
                 "SELECT count(*) FROM messages"
@@ -367,6 +422,8 @@ def search_all(
         }
         if used_query != query:
             result["interpreted_as"] = used_query
+        if parsed.filters:
+            result["original_query"] = original_query
         return result
     finally:
         connection.close()

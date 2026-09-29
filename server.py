@@ -117,10 +117,23 @@ def search_all(
     stale, index_status says so and sync_index refreshes it.
 
     Subject, sender, To and Cc recipients, body and attachment names are all searched.
-    Words can be restricted to one field (subject, sender, to, cc, attachments,
-    body) with "subject: facture", "to: jane" or "cc: example.org"; "recipients:"
-    searches To and Cc together. Combine with
-    AND / OR / NOT, and quoted for an exact phrase.
+    Words can be restricted to one field with "subject: facture", "sender: jane"
+    or "attachments: plan"; "recipients:" searches To and Cc together. Combine
+    with AND / OR / NOT, and quote an exact phrase.
+
+    Gmail-style operators (no space after the colon, "-" negates, values may be
+    quoted) are applied as filters, all ANDed (no OR between operators or next to
+    one: refused; "NOT from:x" = "-from:x"; "(from:a has:attachment)" is fine),
+    and the rest is the text search:
+    from: to: cc: (address, "@domain" or part of a name; "me" = your accounts),
+    has:attachment, filename:, larger: smaller: (500K, 2M), older_than:
+    newer_than: (30d, 2w, 6m, 1y), after: (inclusive) before: (exclusive)
+    YYYY-MM-DD, is:unread|read|flagged|starred|bulk (a message in several
+    mailboxes matches when any copy does), in: (mailbox name or last path
+    segment as stored, e.g. in:inbox; a localised display name is not mapped). "to:jane" is the address filter; to search the To
+    column as words write "to: jane" (space) or "{to}: jane". A query of
+    operators alone is fine (newest first). The answer's "filters" shows how the
+    query was read.
 
     Results come best match first by default: a word in the subject counts
     most, then the sender, attachment names, and finally To/Cc and body,

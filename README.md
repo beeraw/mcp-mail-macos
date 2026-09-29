@@ -262,10 +262,44 @@ in `launchd/com.mcp-mail-macos.sync.plist` before installing it.
 
 `search_all` covers the whole archive in milliseconds. Subject, sender,
 To and Cc recipients, body and attachment names are all indexed. FTS5 syntax
-works — `subject: invoice`, `to: jane`, `cc: example.org` (`recipients:` searches
+works — `subject: invoice`, `sender: jane` (`recipients:` searches
 To and Cc together), `AND` / `OR` / `NOT`, `"exact phrase"`, `NEAR(one two, 5)`.
 A query that is not valid FTS5 (`invoice 12/2025`) is reinterpreted word by
 word, which the answer reports in `interpreted_as`.
+
+#### Operators
+
+Gmail-style operators are read first and become SQL filters (on `messages`,
+`locations` and `recipients`); only the remaining text goes to FTS5. Write them
+with no space after the colon, quote values that hold spaces (`from:"jane doe"`),
+and prefix `-` to negate (`-is:bulk`). Keys are case-insensitive, operators
+combine with AND only (also two of the same kind): `OR` next to an operator, or an operator sharing parentheses with `OR` or free text, is refused with a hint (use `-key:` to exclude, run two searches for alternatives). `NOT from:x` is `-from:x`, and parentheses wrapping operators only, `(from:a has:attachment)`, are ignored. Operators also combine with the
+`account`, `mailbox`, `unread_only`, `flagged_only`, `since` and `until`
+parameters. A query made only of operators works and returns the newest first.
+An unknown `word:` stays free text; a bad value is refused with a hint. The
+answer's `filters` shows how the query was understood (`original_query` holds
+what was typed).
+
+| Operator | Meaning |
+| --- | --- |
+| `from:` | sender: full address, `@example.com` (domain and subdomains) or part of the name or address (`from:example.com`, `from:jane`); `from:me` = your accounts |
+| `to:` `cc:` | same, on the recipients table; `to:me` / `cc:me` = your accounts |
+| `has:attachment` | a real attachment (same meaning as `has_attachment`) |
+| `filename:` | attachment name, as typed or stemmed (`filename:plan.pdf`, `filename:budget`) |
+| `larger:` `smaller:` | size, `500K`, `2M`, `1G` or bytes (K = 1024) |
+| `older_than:` `newer_than:` | relative to now: `30d`, `2w`, `6m` (30 days), `1y` (365 days) |
+| `after:` `before:` | `YYYY-MM-DD` or `YYYY/MM/DD`, local midnight; `after` inclusive, `before` exclusive |
+| `is:unread` `is:read` `is:flagged` `is:starred` `is:bulk` | read state, flag (`starred` = `flagged`), newsletter / mailing list |
+| `in:` | mailbox, case-insensitive: the whole name or its last path segment as Mail stores it, so a localised display name such as "Boîte de réception" is not mapped to INBOX (`in:inbox`, `in:archive` for `[Work]/Archive`) |
+
+A message filed in several mailboxes (Gmail's All Mail and Important, typically)
+matches `is:unread`, `is:read`, `is:flagged` and `in:` when any of its copies
+does; a negation is the exact opposite (`-is:unread` = unread in none).
+`to:` and `cc:` are also names of FTS columns: the operator wins. To search
+those columns as words, write a space (`to: jane`) or braces (`{to}: jane`,
+`{to cc}: jane`). `me` is read from Mail's account list on first use (one
+AppleScript call, cached for the life of the server); if Mail cannot answer,
+only that query fails, with a hint to use the address itself.
 
 Results are ranked by relevance by default (`sort="relevance"`): weighted bm25
 with a subject match counting most, then sender, attachment names, and
