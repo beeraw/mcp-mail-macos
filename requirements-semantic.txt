@@ -1,0 +1,3 @@
+# Optional: search by meaning (mail_vectors.py, search_all mode="semantic"/"hybrid").
+# Without it, and without Ollama, search works exactly as before on keywords.
+sqlite-vec>=0.1.6

@@ -43,6 +43,7 @@ import mail_search
 import mail_stem
 import mail_signature
 import mail_tools
+import mail_vectors
 from mail_tools import MailError, MessageReference
 
 
@@ -3374,8 +3375,8 @@ class AttachmentToolRunnerTests(unittest.TestCase):
         os.chmod(self.tool, 0o755)
 
     def test_every_file_gets_a_result_even_when_the_tool_hangs_or_dies(self):
-        with mock.patch.object(mail_attachments, "TOOL_START_TIMEOUT", 1), \
-                mock.patch.object(mail_attachments, "TOOL_STALL_TIMEOUT", 1):
+        with mock.patch.object(mail_attachments, "TOOL_START_TIMEOUT", 8), \
+                mock.patch.object(mail_attachments, "TOOL_STALL_TIMEOUT", 8):
             results = mail_attachments.run_batch(self.tool, ["a", "hang", "b", "crash", "c"])
         self.assertEqual([results[name]["error"] for name in ("a", "hang", "b", "crash", "c")],
                          [None, "tool_failed", None, "tool_failed", None])
@@ -3574,6 +3575,718 @@ class SavedSearchPathTests(unittest.TestCase):
         environment["MAIL_MCP_SAVED_SEARCHES_PATH"] = "/elsewhere/mine.json"
         with mock.patch.dict(os.environ, environment):
             self.assertEqual(mail_saved.storage_path(), "/elsewhere/mine.json")
+
+
+# --------------------------------------------------------------------------
+# Search by meaning (MCPMAILMAC-12)
+# --------------------------------------------------------------------------
+
+# Words the fake model treats as one concept, so "strategy" is close to "roadmap"
+# without sharing a letter: the whole point of a semantic search.
+_CONCEPTS = {"strategy": "C_plan", "roadmap": "C_plan", "plan": "C_plan", "agenda": "C_plan",
+             "money": "C_cash", "budget": "C_cash", "finance": "C_cash", "cost": "C_cash"}
+
+
+class FakeEmbedder:
+    """Deterministic stand-in for Ollama: a hashed bag of concepts, no network."""
+
+    model = "fake"
+    DIMENSIONS = 512
+
+    def __init__(self):
+        self.calls: list[list[str]] = []
+        self.fail: EmbedderError | None = None
+
+    def vector(self, text: str) -> list[float]:
+        import zlib
+
+        values = [0.0] * self.DIMENSIONS
+        for word in text.lower().replace("\n", " ").split():
+            token = _CONCEPTS.get(word.strip(".,"), word.strip(".,"))
+            values[zlib.crc32(token.encode()) % self.DIMENSIONS] += 1.0
+        return values
+
+    def embed(self, texts, timeout=None):
+        self.calls.append(list(texts))
+        if self.fail is not None:
+            raise self.fail
+        return [self.vector(text) for text in texts]
+
+    def reachable(self, timeout=1.0):
+        return self.fail is None
+
+
+EmbedderError = mail_vectors.EmbedderError
+
+
+class ChunkingTests(unittest.TestCase):
+    def test_a_short_text_is_one_chunk(self):
+        self.assertEqual(mail_vectors.split_text("A short note."), ["A short note."])
+
+    def test_an_empty_text_has_no_chunk(self):
+        self.assertEqual(mail_vectors.split_text("   "), [])
+
+    def test_a_long_text_is_cut_with_overlap_and_no_word_is_split(self):
+        text = " ".join(f"word{number}" for number in range(600))
+        chunks = mail_vectors.split_text(text, size=200, overlap=40, limit=100)
+        self.assertGreater(len(chunks), 3)
+        words = set(text.split())
+        for chunk in chunks:
+            self.assertLessEqual(len(chunk), 200 + mail_vectors.MIN_TAIL_CHARS)
+            self.assertTrue(set(chunk.split()) <= words)
+        for before, after in zip(chunks, chunks[1:]):
+            self.assertTrue(set(before.split()[-3:]) & set(after.split()[:12]), "chunks must overlap")
+
+    def test_every_word_of_a_text_within_the_cap_is_covered(self):
+        text = " ".join(f"word{number}" for number in range(300))
+        chunks = mail_vectors.split_text(text, size=200, overlap=40, limit=100)
+        self.assertEqual({word for chunk in chunks for word in chunk.split()}, set(text.split()))
+
+    def test_the_number_of_chunks_is_capped(self):
+        text = "Sentence number one is here. " * 2000
+        self.assertEqual(len(mail_vectors.split_text(text)), mail_vectors.MAX_CHUNKS)
+
+    def test_a_cut_prefers_the_end_of_a_sentence(self):
+        text = ("First sentence of the note. " * 40).strip()
+        chunks = mail_vectors.split_text(text, size=300, overlap=50, limit=10)
+        self.assertTrue(chunks[0].endswith("."))
+
+    def test_a_tiny_tail_joins_the_last_chunk(self):
+        text = "a " * 495 + "end"
+        chunks = mail_vectors.split_text(text.strip(), size=500, overlap=100, limit=10)
+        self.assertTrue(chunks[-1].endswith("end"))
+        self.assertGreater(len(chunks[-1]), mail_vectors.MIN_TAIL_CHARS)
+
+    def test_links_and_long_tokens_are_not_embedded(self):
+        cleaned = mail_vectors.clean_text("See https://example.com/a?b=1 and www.example.org now " + "x" * 80)
+        self.assertEqual(cleaned, "See and now")
+
+    def test_the_subject_travels_with_the_first_chunk_only(self):
+        chunks = mail_vectors.message_chunks("Budget review", " ".join(["body"] * 600))
+        self.assertTrue(chunks[0].embed.startswith("Budget review\n"))
+        self.assertNotIn("Budget", chunks[1].embed)
+        self.assertNotIn("Budget", chunks[0].text)
+
+    def test_a_message_without_a_body_is_still_embedded_by_its_subject(self):
+        chunks = mail_vectors.message_chunks("Budget review", "")
+        self.assertEqual([(chunk.source, chunk.embed) for chunk in chunks], [("subject", "Budget review")])
+        self.assertEqual(mail_vectors.message_chunks("", ""), [])
+
+    def test_the_hash_follows_the_text(self):
+        self.assertEqual(mail_vectors.text_hash("a", "b"), mail_vectors.text_hash("a", "b"))
+        self.assertNotEqual(mail_vectors.text_hash("a", "b"), mail_vectors.text_hash("a", "c"))
+
+
+class VectorMathTests(unittest.TestCase):
+    def test_quantising_keeps_the_direction(self):
+        vector = [0.1, -0.3, 0.25, 0.0]
+        self.assertGreater(mail_vectors.cosine(mail_vectors.quantize(vector), mail_vectors.quantize([x * 7 for x in vector])), 0.9999)
+
+    def test_opposite_vectors_score_minus_one(self):
+        self.assertAlmostEqual(mail_vectors.cosine(mail_vectors.quantize([1, 2, 3]), mail_vectors.quantize([-1, -2, -3])), -1, places=2)
+
+    def test_a_zero_vector_scores_zero(self):
+        self.assertEqual(mail_vectors.cosine(mail_vectors.quantize([0, 0]), mail_vectors.quantize([1, 2])), 0.0)
+
+    def test_the_python_similarity_agrees_with_sqlite_vec(self):
+        connection = sqlite3.connect(":memory:")
+        if not mail_vectors.load_sqlite_vec(connection):
+            self.skipTest("sqlite-vec is not installed")
+        rng = random.Random(4)
+        left = mail_vectors.quantize([rng.gauss(0, 1) for _ in range(64)])
+        right = mail_vectors.quantize([rng.gauss(0, 1) for _ in range(64)])
+        native = 1.0 - connection.execute(
+            "SELECT vec_distance_cosine(vec_int8(?), vec_int8(?))", (left, right)).fetchone()[0]
+        self.assertAlmostEqual(native, mail_vectors.cosine(left, right), places=4)
+
+
+class _VectorsMixin(_FictionalIndexMixin):
+    """The fictional index plus a vectors file built with the fake embedder."""
+
+    BODIES = {1: "the roadmap is discussed here", 2: "see you there", 3: "roadmap",
+              4: "quarterly budget figures", 5: "quarterly budget figures", 6: "quarterly budget figures"}
+
+    def setUp(self):
+        super().setUp()
+        self.vectors_path = os.path.join(self.directory.name, "vectors.sqlite")
+        self.embedder = FakeEmbedder()
+        for patcher in (
+            mock.patch.object(mail_vectors, "database_path", lambda: self.vectors_path),
+            mock.patch.object(mail_vectors, "default_embedder", lambda: self.embedder),
+            mock.patch.dict(os.environ, {"MAIL_MCP_EMBEDDING_MODEL": "fake"}),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        mail_vectors.reset_state()
+        self.addCleanup(mail_vectors.reset_state)
+
+    def build(self, **kwargs):
+        options = dict(files={number: str(number) for number in self.BODIES},
+                       read_body=lambda path: self.BODIES[int(path)], embedder=self.embedder)
+        options.update(kwargs)
+        return mail_vectors.sync(None, self.vectors_path, self.path, **options)
+
+    def search(self, query, **kwargs):
+        return mail_search.search_all(query, max_age_minutes=10**9, **kwargs)
+
+
+class VectorSyncTests(_VectorsMixin, unittest.TestCase):
+    def test_a_build_embeds_every_message_once(self):
+        result = self.build()
+        self.assertEqual((result.embedded, result.chunks), (6, 6))
+        self.assertEqual(sum(len(call) for call in self.embedder.calls), 6)
+
+    def test_the_first_chunk_carries_the_subject(self):
+        self.build()
+        sent = [text for call in self.embedder.calls for text in call]
+        self.assertIn("Kickoff\nroadmap", sent)
+
+    def test_a_rerun_embeds_nothing_more(self):
+        self.build()
+        self.embedder.calls.clear()
+        self.assertEqual(self.build().embedded, 0)
+        self.assertEqual(self.embedder.calls, [])
+
+    def test_an_interrupted_run_resumes_where_it_stopped(self):
+        self.build(limit=2)
+        self.embedder.calls.clear()
+        result = self.build()
+        self.assertEqual(result.embedded, 4)
+        self.assertEqual(sum(len(call) for call in self.embedder.calls), 4)
+
+    def test_a_server_that_goes_down_keeps_what_was_stored(self):
+        first = FakeEmbedder()
+        original = first.embed
+
+        def flaky(texts, timeout=None):
+            if len(first.calls) >= 2:
+                first.fail = EmbedderError("down")
+            return original(texts, timeout)
+
+        first.embed = flaky
+        with self.assertRaises(EmbedderError):
+            self.build(embedder=first, batch=1)
+        stored = sqlite3.connect(self.vectors_path).execute("SELECT count(*) FROM messages").fetchone()[0]
+        self.assertEqual(stored, 2)
+        self.assertEqual(self.build().embedded, 4)
+        report = mail_vectors.status(6, self.vectors_path, probe=False)
+        self.assertTrue(report["last_run_complete"])
+
+    def test_a_run_cut_short_by_another_error_is_not_complete(self):
+        with mock.patch.object(mail_index, "scan_message_files", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                mail_vectors.sync("/store", self.vectors_path, self.path, embedder=self.embedder)
+        self.assertFalse(mail_vectors.status(6, self.vectors_path, probe=False)["last_run_complete"])
+
+    def test_an_all_zero_vector_is_not_stored(self):
+        class Zero(FakeEmbedder):
+            def vector(self, text):
+                return [0.0] * 8 if "Kickoff" in text else super().vector(text)
+
+        self.assertEqual(self.build(embedder=Zero()).skipped, 1)
+
+    def test_the_lock_is_released_after_a_failure(self):
+        self.embedder.fail = EmbedderError("down")
+        with self.assertRaises(EmbedderError):
+            self.build()
+        self.assertFalse(os.path.exists(self.vectors_path + ".sync.lock"))
+
+    def test_a_second_run_at_the_same_time_is_refused(self):
+        with mail_index.IndexLock(self.vectors_path):
+            with self.assertRaises(mail_index.IndexBusy):
+                self.build()
+
+    def test_the_vectors_of_a_vanished_message_are_deleted(self):
+        self.build()
+        index = sqlite3.connect(self.path)
+        index.execute("DELETE FROM messages WHERE id = 3")
+        index.commit()
+        index.close()
+        self.assertEqual(self.build().removed, 1)
+        with sqlite3.connect(self.vectors_path) as connection:
+            self.assertEqual(connection.execute("SELECT count(*) FROM chunks WHERE message = 3").fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT count(*) FROM messages").fetchone()[0], 5)
+
+    def test_verify_embeds_again_only_what_changed(self):
+        self.build()
+        self.embedder.calls.clear()
+        self.BODIES[3] = "a completely different text"
+        try:
+            result = self.build(verify=True)
+        finally:
+            self.BODIES[3] = "roadmap"
+        self.assertEqual(result.embedded, 1)
+        self.assertEqual(len(self.embedder.calls), 1)
+        with sqlite3.connect(self.vectors_path) as connection:
+            self.assertEqual(connection.execute("SELECT count(*) FROM chunks WHERE message = 3").fetchone()[0], 1)
+
+    def test_a_sample_embeds_a_reproducible_subset(self):
+        self.build(sample=(50.0, 1))
+        again = {row[0] for row in sqlite3.connect(self.vectors_path).execute("SELECT message FROM messages")}
+        self.assertEqual(again, {i for i in range(1, 7) if mail_vectors._sample(i, 1, 50.0)})
+        self.assertFalse(mail_vectors.status(6, self.vectors_path, probe=False)["last_run_complete"])
+
+    def test_a_model_change_needs_a_rebuild(self):
+        self.build()
+        with mock.patch.dict(os.environ, {"MAIL_MCP_EMBEDDING_MODEL": "other"}):
+            with self.assertRaises(MailError) as caught:
+                mail_vectors.open_database(self.vectors_path)
+        self.assertEqual(caught.exception.code, "vectors_outdated")
+
+    def test_a_rebuild_starts_from_nothing(self):
+        self.build()
+        self.embedder.calls.clear()
+        self.assertEqual(self.build(rebuild=True).embedded, 6)
+
+    def test_a_refused_batch_is_retried_text_by_text(self):
+        class Picky(FakeEmbedder):
+            def embed(self, texts, timeout=None):
+                if len(texts) > 1 or "Kickoff" in texts[0]:
+                    raise EmbedderError("bad input", transient=False)
+                return super().embed(texts)
+
+        result = self.build(embedder=Picky(), batch=6)
+        self.assertEqual(result.embedded, 6)
+        self.assertGreaterEqual(result.skipped, 1)
+
+    def test_the_status_reports_coverage_and_freshness(self):
+        self.build(limit=3)
+        partial = mail_vectors.status(6, self.vectors_path, probe=False)
+        self.assertEqual((partial["messages"], partial["coverage"], partial["fresh"]), (3, 0.5, False))
+        self.build()
+        full = mail_vectors.status(6, self.vectors_path, probe=False)
+        self.assertEqual((full["coverage"], full["fresh"], full["model"]), (1.0, True, "fake"))
+        self.assertEqual(mail_vectors.status(6, self.vectors_path + ".none")["built"], False)
+
+
+class SemanticSearchTests(_VectorsMixin, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        self.build()
+
+    def ids(self, query, **kwargs):
+        return [message["mail_id"] for message in self.search(query, **kwargs)["messages"]]
+
+    def test_keyword_is_the_default_and_ignores_the_vectors(self):
+        result = self.search("roadmap")
+        self.assertEqual(result["mode"], "keyword")
+        self.assertEqual(self.ids("strategy"), [])
+        self.assertTrue(all(len(call) > 1 or call[0] != "strategy" for call in self.embedder.calls))
+
+    def test_semantic_finds_a_message_that_shares_no_word_with_the_query(self):
+        result = self.search("strategy", mode="semantic")
+        self.assertEqual(result["mode"], "semantic")
+        self.assertEqual(self.ids("strategy", mode="semantic")[0], 3)
+        found = {message["mail_id"]: message for message in result["messages"]}
+        self.assertEqual(found[3]["match"], "semantic")
+        self.assertGreater(found[3]["similarity"], 0.5)
+
+    def test_hybrid_ranks_a_message_found_both_ways_first(self):
+        result = self.search("roadmap", mode="hybrid")
+        first = result["messages"][0]
+        self.assertEqual(first["match"], "both")
+        self.assertIn(first["mail_id"], (2, 3))
+        matches = {message["mail_id"]: message["match"] for message in result["messages"]}
+        self.assertEqual(matches[4], "semantic")  # "Shared plan": no keyword hit
+
+    def test_hybrid_reaches_a_semantic_only_message_keyword_misses(self):
+        self.assertEqual(self.ids("strategy"), [])
+        self.assertIn(3, self.ids("strategy", mode="hybrid"))
+
+    def test_rrf_scores_are_the_sum_over_both_lists(self):
+        hits = [mail_vectors.Hit(2, 0.9, 0), mail_vectors.Hit(1, 0.8, 0)]
+        connection = mail_search._connect()
+        try:
+            keyword = [connection.execute("SELECT id, account, subject, sender, date_received, rfc_id,"
+                                          " has_attachment, is_bulk FROM messages WHERE id = ?", (identifier,)).fetchone()
+                       for identifier in (1, 3)]
+            fused = mail_search._fuse(connection, keyword, hits, "hybrid", [], [], "", 10, "relevance")
+        finally:
+            connection.close()
+        by_id = {entry["id"]: entry for entry in fused}
+        k, weight = mail_search.RRF_K, mail_search.RRF_SEMANTIC_WEIGHT
+        self.assertAlmostEqual(by_id[1]["rrf"], 1 / (k + 1) + weight / (k + 2))
+        self.assertAlmostEqual(by_id[3]["rrf"], 1 / (k + 2))
+        self.assertAlmostEqual(by_id[2]["rrf"], weight / (k + 1))
+        self.assertEqual([entry["id"] for entry in fused], [1, 3, 2])
+        self.assertEqual((by_id[1]["match"], by_id[2]["match"], by_id[3]["match"]), ("both", "semantic", "keyword"))
+
+    def test_with_equal_weights_the_lists_count_alike(self):
+        hits = [mail_vectors.Hit(2, 0.9, 0)]
+        connection = mail_search._connect()
+        try:
+            keyword = [connection.execute("SELECT id, account, subject, sender, date_received, rfc_id,"
+                                          " has_attachment, is_bulk FROM messages WHERE id = 1").fetchone()]
+            with mock.patch.object(mail_search, "RRF_SEMANTIC_WEIGHT", 1.0):
+                fused = mail_search._fuse(connection, keyword, hits, "hybrid", [], [], "", 10, "relevance")
+        finally:
+            connection.close()
+        self.assertAlmostEqual(fused[0]["rrf"], fused[1]["rrf"])
+
+    def test_a_date_sort_orders_the_fused_top_by_date(self):
+        ranked = self.ids("roadmap", mode="hybrid", limit=6)
+        by_date = self.ids("roadmap", mode="hybrid", limit=6, sort="date")
+        self.assertEqual(sorted(ranked), sorted(by_date))
+        dates = {row[0]: row[1] or 0 for row in sqlite3.connect(self.path).execute("SELECT id, date_received FROM messages")}
+        self.assertEqual(by_date, sorted(by_date, key=lambda identifier: -dates[identifier]))
+
+    def test_a_message_is_scored_by_its_best_chunk(self):
+        with sqlite3.connect(self.vectors_path) as connection:
+            connection.execute("DELETE FROM chunks WHERE message = 1")
+            for number, text in enumerate(("weather forecast", "roadmap strategy", "lunch menu")):
+                connection.execute(
+                    "INSERT INTO chunks (message, chunk, source, vector) VALUES (1, ?, 'body', ?)",
+                    (number, mail_vectors.quantize(self.embedder.vector(text))))
+        hits = mail_vectors.search_hits(self.embedder.vector("strategy"), model="fake")
+        ones = [hit for hit in hits if hit.message == 1]
+        self.assertEqual(len(ones), 1)
+        self.assertEqual(ones[0].chunk, 1)
+        self.assertEqual([hit.score for hit in hits], sorted((hit.score for hit in hits), reverse=True))
+
+    def test_operators_filter_semantic_hits(self):
+        self.assertNotIn(3, self.ids("strategy from:john@example.org", mode="semantic"))
+        only_jane = self.ids("strategy from:jane@example.com", mode="semantic")
+        self.assertTrue(only_jane and 2 not in only_jane)
+        self.assertEqual(self.ids("strategy from:nobody@example.com", mode="semantic"), [])
+
+    def test_a_narrow_filter_is_applied_before_the_candidate_cap(self):
+        # Only message 2 passes the filter, and it is far from the best match for
+        # the query: a cap of one chunk applied first would lose it.
+        with mock.patch.object(mail_search, "SEMANTIC_CHUNKS", 1):
+            self.assertEqual(self.ids("strategy from:john@example.org", mode="semantic"), [2])
+
+    def test_dates_and_accounts_filter_semantic_hits(self):
+        self.assertEqual(self.ids("strategy", mode="semantic", since="2999-01-01"), [])
+        self.assertEqual(self.ids("strategy", mode="semantic", account="Home"), [])
+        self.assertTrue(self.ids("strategy", mode="semantic", account="Work"))
+        self.assertIn(3, self.ids("strategy older_than:1000d", mode="semantic"))
+        self.assertNotIn(3, self.ids("strategy newer_than:1000d", mode="semantic"))
+
+    def test_too_many_ids_to_pass_along_still_filters_afterwards(self):
+        with mock.patch.object(mail_search, "ATTACHMENT_ID_LIMIT", 0):
+            self.assertEqual(self.ids("strategy from:john@example.org", mode="semantic"), [2])
+
+    def test_a_semantic_only_hit_has_an_excerpt_of_the_chunk(self):
+        body = "the roadmap for the year: " + "details " * 60
+        with mock.patch.object(mail_index, "find_store", return_value="/store"), \
+                mock.patch.object(mail_index, "find_message_file", return_value="/f"), \
+                mock.patch.object(mail_index, "extract_message",
+                                  return_value=mail_index.Extracted("", body, True, "", False)):
+            result = self.search("strategy", mode="semantic", limit=1)
+        snippet = result["messages"][0]["snippet"]
+        self.assertTrue(snippet.startswith("the roadmap for the year"))
+        self.assertLessEqual(len(snippet), 202)
+        self.assertNotIn("snippet", self.search("strategy", mode="semantic", snippets=False)["messages"][0])
+
+    def test_a_query_is_reduced_to_plain_words_for_the_model(self):
+        self.search('subject: "strategy" AND (roadmap OR plan) NOT draft from:jane@example.com', mode="semantic")
+        self.assertEqual(self.embedder.calls[-1], ["strategy roadmap plan"])
+        self.assertEqual(mail_search.semantic_text("{to}: jane agenda"), "jane agenda")
+
+    def test_embedding_the_same_query_twice_asks_the_server_once(self):
+        self.embedder.calls.clear()
+        self.search("strategy", mode="semantic")
+        self.search("strategy", mode="semantic")
+        self.assertEqual(len(self.embedder.calls), 1)
+
+    def test_an_unknown_mode_is_refused(self):
+        with self.assertRaises(MailError) as caught:
+            self.search("strategy", mode="magic")
+        self.assertEqual(caught.exception.code, "invalid_mode")
+
+    def test_semantic_needs_some_text(self):
+        with self.assertRaises(MailError) as caught:
+            self.search("from:jane@example.com", mode="semantic")
+        self.assertEqual(caught.exception.code, "semantic_needs_text")
+
+    def test_hybrid_on_operators_alone_is_a_plain_search(self):
+        result = self.search("from:jane@example.com", mode="hybrid")
+        self.assertEqual(result["mode"], "keyword")
+        self.assertNotIn("semantic_note", result)
+
+
+class SemanticFallbackTests(_VectorsMixin, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        self.build()
+        mail_vectors.reset_state()
+        self.embedder.calls.clear()
+
+    def test_semantic_without_ollama_is_an_error_with_a_hint(self):
+        self.embedder.fail = EmbedderError("Ollama is not reachable", "Start it.")
+        with self.assertRaises(MailError) as caught:
+            self.search("strategy", mode="semantic")
+        self.assertEqual(caught.exception.code, "semantic_unavailable")
+        self.assertEqual(caught.exception.hint, "Start it.")
+
+    def test_hybrid_without_ollama_answers_with_keywords_and_says_so(self):
+        self.embedder.fail = EmbedderError("Ollama is not reachable")
+        result = self.search("roadmap", mode="hybrid")
+        self.assertEqual(result["mode"], "keyword")
+        self.assertIn("semantic_unavailable", result["semantic_note"])
+        self.assertEqual([m["mail_id"] for m in result["messages"]], [2, 3, 1])
+
+    def test_a_date_sorted_hybrid_that_falls_back_is_the_plain_date_search(self):
+        self.embedder.fail = EmbedderError("down")
+        self.assertEqual([m["mail_id"] for m in self.search("roadmap", mode="hybrid", sort="date")["messages"]], [1, 2, 3])
+
+    def test_a_failure_is_not_retried_for_a_minute(self):
+        self.embedder.fail = EmbedderError("down")
+        self.search("roadmap", mode="hybrid")
+        self.search("plan", mode="hybrid")
+        self.assertEqual(len(self.embedder.calls), 1)
+        mail_vectors.reset_state()
+        self.embedder.fail = None
+        self.assertEqual(self.search("roadmap", mode="hybrid")["mode"], "hybrid")
+
+    def test_a_refused_input_is_not_a_reason_to_stop_asking(self):
+        self.embedder.fail = EmbedderError("bad input", transient=False)
+        self.search("roadmap", mode="hybrid")
+        self.search("plan", mode="hybrid")
+        self.assertEqual(len(self.embedder.calls), 2)
+
+    def test_without_the_vectors_file_hybrid_falls_back_and_semantic_fails(self):
+        os.unlink(self.vectors_path)
+        result = self.search("roadmap", mode="hybrid")
+        self.assertEqual(result["mode"], "keyword")
+        self.assertIn("vectors_missing", result["semantic_note"])
+        with self.assertRaises(MailError) as caught:
+            self.search("roadmap", mode="semantic")
+        self.assertEqual(caught.exception.code, "vectors_missing")
+        self.assertIn("mail_vectors.py --build", caught.exception.hint)
+
+    def test_a_vectors_file_of_another_model_is_not_used(self):
+        with mock.patch.dict(os.environ, {"MAIL_MCP_EMBEDDING_MODEL": "other"}):
+            result = self.search("roadmap", mode="hybrid")
+        self.assertEqual(result["mode"], "keyword")
+        self.assertIn("vectors_outdated", result["semantic_note"])
+
+    def test_an_unreadable_vectors_file_does_not_break_search(self):
+        with open(self.vectors_path, "wb") as handle:
+            handle.write(b"this is not a database" * 100)
+        result = self.search("roadmap", mode="hybrid")
+        self.assertEqual([m["mail_id"] for m in result["messages"]], [2, 3, 1])
+        self.assertIn("semantic_note", result)
+
+    def test_without_sqlite_vec_a_small_search_still_works_in_python(self):
+        with mock.patch.object(mail_vectors, "load_sqlite_vec", return_value=False):
+            found = self.search("strategy", mode="semantic")
+        self.assertEqual(found["messages"][0]["mail_id"], 3)
+
+    def test_without_sqlite_vec_a_big_search_is_refused_with_a_hint(self):
+        with mock.patch.object(mail_vectors, "load_sqlite_vec", return_value=False), \
+                mock.patch.object(mail_vectors, "PYTHON_FALLBACK_CHUNKS", 2):
+            with self.assertRaises(MailError) as caught:
+                self.search("strategy", mode="semantic")
+            self.assertEqual(caught.exception.code, "semantic_needs_sqlite_vec")
+            self.assertIn("pip install sqlite-vec", caught.exception.hint)
+            hybrid = self.search("roadmap", mode="hybrid")
+        self.assertEqual(hybrid["mode"], "keyword")
+        self.assertIn("semantic_needs_sqlite_vec", hybrid["semantic_note"])
+
+    def test_a_null_similarity_from_sqlite_vec_is_skipped(self):
+        with sqlite3.connect(self.vectors_path) as connection:
+            connection.execute("UPDATE chunks SET vector = zeroblob(512) WHERE message = 3")
+        hits = mail_vectors.search_hits(self.embedder.vector("strategy"), model="fake")
+        self.assertNotIn(3, [hit.message for hit in hits])
+        self.assertEqual(self.search("strategy", mode="hybrid")["mode"], "hybrid")
+
+    def test_an_explicit_hybrid_on_partial_vectors_says_so(self):
+        with sqlite3.connect(self.vectors_path) as connection:
+            connection.execute("DELETE FROM messages WHERE message > 2")
+        note = self.search("roadmap", mode="hybrid")["semantic_note"]
+        self.assertIn("cover only 33%", note)
+
+    def test_the_python_and_native_rankings_agree(self):
+        connection = sqlite3.connect(":memory:")
+        if not mail_vectors.load_sqlite_vec(connection):
+            self.skipTest("sqlite-vec is not installed")
+        query = self.embedder.vector("strategy budget")
+        native = mail_vectors.search_hits(query, model="fake")
+        with mock.patch.object(mail_vectors, "load_sqlite_vec", return_value=False):
+            python = mail_vectors.search_hits(query, model="fake")
+        self.assertEqual([hit.message for hit in native], [hit.message for hit in python])
+
+
+class SemanticDefaultModeTests(_VectorsMixin, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        mail_vectors.reset_state()
+
+    def with_setting(self, value):
+        return mock.patch.dict(os.environ, {"MAIL_MCP_SEARCH_MODE": value})
+
+    def test_auto_without_vectors_is_keyword_and_silent(self):
+        with self.with_setting("auto"):
+            result = self.search("roadmap")
+        self.assertEqual(result["mode"], "keyword")
+        self.assertNotIn("semantic_note", result)
+        self.assertEqual(self.embedder.calls, [])
+
+    def test_auto_with_partial_vectors_stays_keyword(self):
+        self.build(limit=2)
+        with self.with_setting("auto"):
+            self.assertEqual(self.search("roadmap")["mode"], "keyword")
+
+    def test_auto_with_fresh_vectors_is_hybrid(self):
+        self.build()
+        with self.with_setting("auto"):
+            self.assertEqual(self.search("roadmap")["mode"], "hybrid")
+            self.assertEqual(self.search("roadmap", mode="keyword")["mode"], "keyword")
+
+    def test_auto_needs_sqlite_vec(self):
+        self.build()
+        with self.with_setting("auto"), mock.patch.object(mail_vectors, "load_sqlite_vec", return_value=False):
+            self.assertEqual(self.search("roadmap")["mode"], "keyword")
+
+    def test_an_explicit_mode_beats_the_setting(self):
+        self.build()
+        with self.with_setting("keyword"):
+            self.assertEqual(self.search("roadmap", mode="hybrid")["mode"], "hybrid")
+
+    def test_the_index_status_reports_the_vectors(self):
+        self.build()
+        report = mail_search.index_status()["vectors"]
+        self.assertTrue(report["built"])
+        self.assertEqual((report["messages"], report["chunks"], report["coverage"]), (6, 6, 1.0))
+
+    def test_a_message_sync_starts_the_vector_sync_only_when_asked_for_and_built(self):
+        with mock.patch.object(mail_vectors.subprocess, "Popen") as popen:
+            self.assertFalse(mail_vectors.start_background_sync())  # no file yet
+            self.build()
+            with mock.patch.dict(os.environ, {"MAIL_MCP_VECTORS_AUTO_SYNC": "0"}):
+                self.assertFalse(mail_vectors.start_background_sync())
+            self.assertEqual(popen.call_count, 0)
+            self.assertTrue(mail_vectors.start_background_sync())
+            self.assertEqual(popen.call_count, 1)
+
+
+class OllamaClientTests(unittest.TestCase):
+    """The HTTP client against a throwaway local server that speaks like Ollama."""
+
+    def setUp(self):
+        import http.server
+
+        test = self
+        self.requests: list[dict] = []
+        self.delay = 0.0
+        self.status = 200
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_POST(self):
+                payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                test.requests.append({"path": self.path, "payload": payload})
+                time.sleep(test.delay)
+                body = json.dumps({"embeddings": [[1.0, 2.0]] * len(payload["input"])} if test.status == 200
+                                  else {"error": "boom"}).encode()
+                self.send_response(test.status)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                body = b'{"version": "0"}'
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def test_texts_go_in_one_request_and_vectors_come_back_in_order(self):
+        client = mail_vectors.OllamaEmbedder(self.url, "bge-m3", 5)
+        self.assertEqual(client.embed(["a", "b"]), [[1.0, 2.0], [1.0, 2.0]])
+        sent = self.requests[0]
+        self.assertEqual(sent["path"], "/api/embed")
+        self.assertEqual((sent["payload"]["model"], sent["payload"]["input"]), ("bge-m3", ["a", "b"]))
+        self.assertTrue(client.reachable())
+
+    def test_the_connection_is_kept_between_requests(self):
+        client = mail_vectors.OllamaEmbedder(self.url, "bge-m3", 5)
+        client.embed(["a"])
+        first = client._connection
+        client.embed(["b"])
+        self.assertIs(client._connection, first)
+
+    def test_a_dropped_connection_is_reopened(self):
+        client = mail_vectors.OllamaEmbedder(self.url, "bge-m3", 5)
+        client.embed(["a"])
+        client._connection.sock.close()
+        self.assertEqual(client.embed(["b"]), [[1.0, 2.0]])
+
+    def test_a_slow_server_is_a_transient_timeout_with_a_hint(self):
+        self.delay = 1.0
+        client = mail_vectors.OllamaEmbedder(self.url, "bge-m3", 0.2)
+        with self.assertRaises(EmbedderError) as caught:
+            client.embed(["a"])
+        self.assertTrue(caught.exception.transient)
+        self.assertIn("ollama_timeout", caught.exception.hint)
+
+    def test_a_server_that_is_not_running_is_reported_with_how_to_start_it(self):
+        self.server.shutdown()
+        self.server.server_close()
+        client = mail_vectors.OllamaEmbedder(self.url, "bge-m3", 1)
+        with self.assertRaises(EmbedderError) as caught:
+            client.embed(["a"])
+        self.assertTrue(caught.exception.transient)
+        self.assertIn("ollama", caught.exception.hint.lower())
+        self.assertFalse(client.reachable())
+
+    def test_an_error_answer_is_not_transient(self):
+        self.status = 500
+        client = mail_vectors.OllamaEmbedder(self.url, "bge-m3", 5)
+        with self.assertRaises(EmbedderError) as caught:
+            client.embed(["a"])
+        self.assertFalse(caught.exception.transient)
+
+    def test_the_settings_pick_the_endpoint_and_the_model(self):
+        with mock.patch.dict(os.environ, {"MAIL_MCP_OLLAMA_URL": self.url, "MAIL_MCP_EMBEDDING_MODEL": "other"}):
+            mail_vectors.reset_state()
+            try:
+                self.assertEqual(mail_vectors.embed_query("hello"), [1.0, 2.0])
+            finally:
+                mail_vectors.reset_state()
+        self.assertEqual(self.requests[0]["payload"]["model"], "other")
+
+
+class EndpointChangeTests(unittest.TestCase):
+    def test_a_new_endpoint_forgets_the_old_failure(self):
+        mail_vectors.reset_state()
+        self.addCleanup(mail_vectors.reset_state)
+        mail_vectors.default_embedder()
+        mail_vectors._down_until = time.time() + 60
+        with mock.patch.dict(os.environ, {"MAIL_MCP_OLLAMA_URL": "http://127.0.0.1:1"}):
+            mail_vectors.default_embedder()
+        self.assertEqual(mail_vectors._down_until, 0.0)
+
+
+class EvalModeTests(unittest.TestCase):
+    def test_run_pairs_hands_the_mode_to_search(self):
+        answer = {"messages": [{"mail_id": 7}]}
+        with mock.patch.object(mail_search, "search_all", return_value=answer) as search:
+            result = mail_eval.run_pairs([{"query": "budget", "expected": 7}], mode="hybrid")
+        self.assertEqual(search.call_args.kwargs["mode"], "hybrid")
+        self.assertEqual(result["aggregate"]["recall_at_1"], 1.0)
+
+    def test_without_a_mode_the_configured_default_applies(self):
+        with mock.patch.object(mail_search, "search_all", return_value={"messages": []}) as search:
+            mail_eval.run_pairs([{"query": "budget", "expected": 7}])
+        self.assertNotIn("mode", search.call_args.kwargs)
+
+    def test_a_mode_the_search_cannot_serve_stops_the_run_with_its_hint(self):
+        error = MailError("semantic_unavailable", "no vectors", "Build them.")
+        with mock.patch.object(mail_search, "search_all", side_effect=error):
+            with self.assertRaises(mail_eval.EvalError):
+                mail_eval.run_pairs([{"query": "budget", "expected": 7}], mode="semantic")
 
 
 if __name__ == "__main__":

@@ -43,3 +43,10 @@ attachments.sqlite-wal
 attachments.sqlite-shm
 attachments.sqlite.sync.lock
 attachments.sqlite.sync.lock.stale.*
+
+# Embeddings for search by meaning (see mail_vectors.py)
+vectors.sqlite
+vectors.sqlite-wal
+vectors.sqlite-shm
+vectors.sqlite.sync.lock
+vectors.sqlite.sync.lock.stale.*

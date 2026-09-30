@@ -109,6 +109,7 @@ def search_all(
     limit: int = 20,
     sort: str = "relevance",
     snippets: bool = True,
+    mode: str | None = None,
 ) -> dict[str, Any]:
     """Search every message of every account, from the local index.
 
@@ -162,6 +163,21 @@ def search_all(
 
     Each result also says whether it has an attachment ("has_attachment") and
     whether it looks like a mailing list or newsletter ("is_bulk").
+
+    Search by meaning: mode="semantic" finds messages about the same thing as
+    the text even when they share none of its words ("unpaid bills" finds
+    "payment reminder"); mode="hybrid" fuses that ranking with the keyword one
+    (Reciprocal Rank Fusion), so an exact word still counts. It needs the local
+    embeddings (mail_vectors.py --build, Ollama with bge-m3); without them, hybrid
+    answers with keywords and explains why in "semantic_note", and semantic is an
+    error with a hint. mode=None takes the search_mode setting (keyword unless set
+    to "auto"). Each result of these modes says how it was found ("match":
+    keyword, semantic or both; "similarity" for the last two). Operators, dates
+    and accounts filter semantic results too. A semantic-only result's snippet is
+    the passage that matched. sort="date" orders the best matches newest first.
+    Operators alone need no mode.
+
+    mode: "keyword", "semantic", "hybrid", or omit for the configured default.
     """
     return _guard(
         mail_search.search_all,
@@ -175,6 +191,7 @@ def search_all(
         limit=limit,
         sort=sort,
         snippets=snippets,
+        mode=mode,
     )
 
 
@@ -321,7 +338,10 @@ def index_status() -> dict[str, Any]:
     """Report what the search index holds and when it was last refreshed.
 
     Also reports "attachments": whether the attachment text index is built, its
-    files by status (ok, pending, skipped, error...), size and last run.
+    files by status (ok, pending, skipped, error...), size and last run; and
+    "vectors": whether search by meaning is ready (embedded messages and chunks,
+    coverage of the index, model, size, last run, whether Ollama answers and
+    sqlite-vec is installed).
     """
     return _guard(mail_search.index_status)
 
@@ -333,6 +353,7 @@ def sync_index() -> dict[str, Any]:
     Needs Full Disk Access for the process running this server. When the
     attachment text index exists, its own sync is started in the background
     ("attachments_sync" in the answer): it takes minutes and is never waited for.
+    The same goes for the embeddings of new mail ("vectors_sync"), once built.
     """
     return _guard(mail_search.sync_index)
 

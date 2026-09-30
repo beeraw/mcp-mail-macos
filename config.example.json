@@ -22,5 +22,12 @@
   "attachments_char_limit": 100000,
   "attachments_auto_sync": true,
 
-  "saved_searches_path": ""
+  "saved_searches_path": "",
+
+  "vectors_path": "",
+  "ollama_url": "http://localhost:11434",
+  "embedding_model": "bge-m3",
+  "ollama_timeout": 5,
+  "search_mode": "keyword",
+  "vectors_auto_sync": true
 }

@@ -44,6 +44,25 @@ BM25_WEIGHTS = (10.0, 5.0, 1.0, 1.0, 3.0, 1.0, 3.0, 1.0, 0.25)
 RECENCY_BOOST = 0.3
 RECENCY_HALF_LIFE_DAYS = 365.0
 SORT_MODES = ("relevance", "date")
+# "auto" is only a setting (search_mode): hybrid when the vectors are ready.
+SEARCH_MODES = ("keyword", "semantic", "hybrid", "auto")
+# Reciprocal Rank Fusion: a message scores the sum of 1 / (RRF_K + rank) over the
+# rankings that hold it. 60 is the constant of the original paper; it keeps a
+# first place from drowning everything below it.
+RRF_K = 60
+# The semantic ranking counts a quarter of the keyword one in the fusion. With
+# equal weights the nearest neighbours of a two-word query (loose by nature) pushed
+# exact matches down: MRR on the eval pairs fell from 0.467 to 0.410. At 0.25 exact
+# matches keep their place (0.440, recall@10 unchanged) while the meaning still
+# lifts a message both rankings hold, and fills the list when few words match: on
+# the pairs whose query words are inflected, MRR rises from 0.330 to 0.358. Chosen
+# on a grid of weights, thresholds and caps (see the README).
+RRF_SEMANTIC_WEIGHT = 0.25
+# Semantic candidates below this cosine similarity are not returned: the nearest
+# neighbours of a query about nothing in the mailbox are noise, not results.
+MIN_SIMILARITY = 0.0
+# Chunks compared per query before they are folded into one score per message.
+SEMANTIC_CHUNKS = 200
 # An attachment's text is a weaker witness than the message itself: its bm25
 # (computed in attachments.sqlite, on another corpus) counts for half when it is
 # added to the message's own score, or alone for a message matched only through
@@ -383,6 +402,188 @@ def _message_filters(
     return name_clause, conditions, parameters
 
 
+_FIELD_PREFIX = re.compile(
+    r"\{[^{}]*\}\s*:|(?<![\w])(?:subject|sender|to|cc|attachments|recipients|body)(?:_stem)?\s*:", re.I)
+_NEGATED_TERM = re.compile(r"\bNOT\s+(?:\"[^\"]*\"|\S+)")
+
+
+def semantic_text(text: str) -> str:
+    """The free text of a query as plain words for the embedding model.
+
+    FTS5 syntax means nothing to it: column prefixes, quotes, parentheses and
+    AND / OR are dropped, and so is a term negated with NOT (it says what the
+    message is not about, which a vector cannot express).
+    """
+    text = _NEGATED_TERM.sub(" ", text)
+    text = _FIELD_PREFIX.sub(" ", text)
+    text = re.sub(r"[\"()*^]", " ", text)
+    text = re.sub(r"\b(?:AND|OR|NEAR)\b", " ", text)
+    return " ".join(text.split())
+
+
+def _allowed_ids(
+    connection: sqlite3.Connection,
+    filters: list[str],
+    filter_parameters: list[Any],
+    name_clause: str,
+) -> tuple[list[int] | None, bool]:
+    """Ids of the messages passing the filters, for a side index that ranks apart.
+
+    Filters (dates, account, operators) apply to messages, not to attachments or
+    vectors: capping by score first would drop the hits of a narrow filter. So the
+    other index is restricted to these ids. Returns (None, False) when there is no
+    filter, and (None, True) when the ids are too many to pass along: the caller
+    then widens its own cap and filters afterwards.
+    """
+    if not filters and not name_clause:
+        return None, False
+    id_conditions = list(filters)
+    id_parameters = list(filter_parameters)
+    if name_clause:
+        id_conditions.append("m.id IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)")
+        id_parameters.append(name_clause)
+    ids = [row[0] for row in connection.execute(
+        "SELECT m.id FROM messages m WHERE " + " AND ".join(id_conditions) + " LIMIT ?",
+        (*id_parameters, ATTACHMENT_ID_LIMIT + 1),
+    )]
+    if len(ids) <= ATTACHMENT_ID_LIMIT:
+        return ids, False
+    return None, True
+
+
+def _vectors_ready(connection: sqlite3.Connection) -> bool:
+    """Whether "auto" may use the vectors: built by this recipe, covering the index, loadable."""
+    try:
+        import mail_vectors
+
+        path = mail_vectors.database_path()
+        if not os.path.isfile(path):
+            return False
+        total = connection.execute("SELECT count(*) FROM messages").fetchone()[0]
+        info = mail_vectors.status(total, path, probe=False)
+        return bool(info.get("fresh") and info.get("sqlite_vec"))
+    except Exception:  # noqa: BLE001 - a side index must never break keyword search
+        return False
+
+
+def _coverage_note(connection: sqlite3.Connection) -> str | None:
+    """A warning when an explicitly requested semantic search runs on a partial vectors file."""
+    try:
+        import mail_vectors
+
+        total = connection.execute("SELECT count(*) FROM messages").fetchone()[0]
+        info = mail_vectors.status(total, probe=False)
+        coverage = info.get("coverage")
+        if coverage is not None and coverage < mail_vectors.FRESH_COVERAGE:
+            return (f"vectors cover only {coverage:.0%} of the index: meaning was searched on that part "
+                    "(finish it with mail_vectors.py --sync)")
+    except Exception:  # noqa: BLE001 - a note is a convenience
+        pass
+    return None
+
+
+def _effective_mode(requested: str, has_text: bool, connection: sqlite3.Connection) -> str:
+    """The mode actually run: "auto" resolved, and keyword when there is no text to compare."""
+    if not has_text:
+        return "keyword"
+    if requested == "auto":
+        return "hybrid" if _vectors_ready(connection) else "keyword"
+    return requested
+
+
+def _semantic_ranking(text: str, id_scope: Any) -> list[Any]:
+    """Messages close in meaning to `text`, best first; MailError when it cannot be done."""
+    import mail_vectors
+
+    if not text.strip():
+        return []
+    try:
+        vector = mail_vectors.embed_query(text)
+    except mail_vectors.EmbedderError as error:
+        raise MailError(
+            "semantic_unavailable",
+            f"The query could not be embedded: {error}",
+            error.hint or 'Use mode="keyword", or start Ollama with the embedding model.',
+        ) from error
+    allowed, narrow = id_scope()
+    hits = mail_vectors.search_hits(
+        vector, allowed, SEMANTIC_CHUNKS * 5 if narrow else SEMANTIC_CHUNKS)
+    return [hit for hit in hits if hit.score >= MIN_SIMILARITY]
+
+
+def _fuse(
+    connection: sqlite3.Connection,
+    keyword_rows: list[Any],
+    hits: list[Any],
+    mode: str,
+    filter_conditions: list[str],
+    filter_parameters: list[Any],
+    name_clause: str,
+    limit: int,
+    sort: str,
+) -> list[dict[str, Any]]:
+    """The keyword and semantic rankings as one list, by Reciprocal Rank Fusion.
+
+    A message scores the sum of weight / (RRF_K + rank) over the rankings holding
+    it (weight 1 for keywords, RRF_SEMANTIC_WEIGHT for meaning in a hybrid search),
+    so one seen by both rises above one seen by either alone, and the two scales
+    (bm25, cosine) never have to be compared. Semantic hits are read from the
+    index under the same filters as keyword ones, so a filter cannot be bypassed
+    by meaning. With mode "semantic" the keyword list is empty. Returns at most
+    `limit` rows, each tagged "match" (keyword / semantic / both) and, when the
+    meaning found it, "similarity" and "chunk"; sort="date" reorders that top.
+    """
+    entries: dict[int, dict[str, Any]] = {}
+    for rank, row in enumerate(keyword_rows, 1):
+        entry = dict(row)
+        entry["match"] = "keyword"
+        entry["rrf"] = 1.0 / (RRF_K + rank)
+        entries[entry["id"]] = entry
+
+    missing = [hit.message for hit in hits if hit.message not in entries]
+    if missing:
+        conditions = list(filter_conditions)
+        parameters = list(filter_parameters)
+        if name_clause:
+            conditions.append("m.id IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)")
+            parameters.append(name_clause)
+        fetched: dict[int, dict[str, Any]] = {}
+        for start in range(0, len(missing), 500):
+            group = missing[start:start + 500]
+            statement = (
+                "SELECT m.id, m.account, m.subject, m.sender, m.date_received, m.rfc_id,"
+                "       m.has_attachment, m.is_bulk FROM messages m WHERE "
+                + " AND ".join([*conditions, f"m.id IN ({','.join('?' * len(group))})"])
+            )
+            for row in connection.execute(statement, (*parameters, *group)).fetchall():
+                fetched[row["id"]] = dict(row)
+    else:
+        fetched = {}
+
+    rank = 0
+    weight = RRF_SEMANTIC_WEIGHT if mode == "hybrid" else 1.0
+    for hit in hits:
+        entry = entries.get(hit.message)
+        if entry is None:
+            entry = fetched.get(hit.message)
+            if entry is None:  # dropped by a filter
+                continue
+            entry["match"] = "semantic"
+            entry["rrf"] = 0.0
+            entries[hit.message] = entry
+        else:
+            entry["match"] = "both"
+        rank += 1
+        entry["rrf"] += weight / (RRF_K + rank)
+        entry["similarity"] = hit.score
+        entry["chunk"] = hit.chunk
+
+    ordered = sorted(entries.values(), key=lambda entry: (-entry["rrf"], -(entry["date_received"] or 0)))[:limit]
+    if sort == "date":
+        ordered.sort(key=lambda entry: -(entry["date_received"] or 0))
+    return ordered
+
+
 def search_all(
     query: str,
     account: str | None = None,
@@ -395,6 +596,7 @@ def search_all(
     max_age_minutes: float = config.get("index_max_age_minutes"),
     sort: str = "relevance",
     snippets: bool = True,
+    mode: str | None = None,
 ) -> dict[str, Any]:
     """Searches every indexed message, across all accounts.
 
@@ -407,6 +609,14 @@ def search_all(
     become SQL filters; only the remaining free text goes to FTS5. A query made
     of operators alone is allowed and comes back newest first. The answer's
     "filters" shows how the query was understood.
+
+    mode: "keyword" (exact words: everything above), "semantic" (messages whose
+    meaning is close to the text, from the embeddings of mail_vectors.py) or
+    "hybrid" (both rankings fused by Reciprocal Rank Fusion). None takes the
+    search_mode setting: "keyword", or "auto" = hybrid once the vectors exist and
+    cover the index. Without Ollama or the vectors, hybrid and auto answer with
+    keywords alone and say why in "semantic_note"; "semantic" fails with a hint.
+    Operators, dates and accounts filter the semantic candidates like any other.
     """
     if sort not in SORT_MODES:
         raise MailError(
@@ -420,6 +630,19 @@ def search_all(
     if not query.strip() and not parsed.filters:
         raise MailError("empty_query", "The query is empty.")
     limit = max(1, min(int(limit), 200))
+    requested_mode = mode if mode is not None else config.get("search_mode")
+    if requested_mode not in SEARCH_MODES:
+        raise MailError(
+            "invalid_mode",
+            f"Unknown mode: {requested_mode!r}.",
+            'Use "keyword", "semantic" or "hybrid".',
+        )
+    if requested_mode == "semantic" and not query.strip():
+        raise MailError(
+            "semantic_needs_text",
+            "A semantic search needs some text to compare, not only operators.",
+            'Add words to the query, or use mode="keyword".',
+        )
     freshness = _refresh_if_stale(max_age_minutes)
     since_ts = _as_timestamp(since)
     until_ts = _as_timestamp(until, end_of_day=True)
@@ -427,7 +650,9 @@ def search_all(
     connection = _connect()
     try:
         has_text = bool(query.strip())
+        free_text = query  # before the field filters are rewritten for FTS5
         query = _legacy_column_filters(query)
+        effective = _effective_mode(requested_mode, has_text, connection)
         name_clause, filter_conditions, filter_parameters = _message_filters(
             parsed, since_ts, until_ts, account, mailbox, unread_only, flagged_only,
         )
@@ -444,34 +669,44 @@ def search_all(
 
         if not has_text:
             sort = "date"  # no free text, so nothing to rank by
+        scope: list[Any] = []
+
+        def id_scope() -> tuple[list[int] | None, bool]:
+            """(ids matching the filters or None, whether they were too many to list)."""
+            if not scope:
+                scope.append(_allowed_ids(
+                    connection, conditions[fts_conditions:], parameters[fts_conditions:], name_clause))
+            return scope[0]
+
+        # Meaning first: whether it answered decides how the keyword side is ranked.
+        semantic = None
+        semantic_note = None
+        if effective in ("semantic", "hybrid"):
+            try:
+                semantic = _semantic_ranking(semantic_text(free_text), id_scope)
+            except MailError as error:
+                if effective == "semantic":
+                    raise
+                semantic_note = f"meaning not searched ({error.code}): {error.message}"
+                effective = "keyword"
+        if semantic is not None and requested_mode in ("semantic", "hybrid"):
+            semantic_note = _coverage_note(connection)
+        keyword_active = effective != "semantic"
+        # The keyword ranking feeds the fusion, so it is by relevance then; a
+        # date sort is applied to the fused list at the end.
+        fusing = effective == "hybrid"
+        keyword_sort = "relevance" if fusing else sort
+        keyword_limit = min(200, max(limit * 3, 50)) if fusing else limit
+
         # Attachment text: another database, merged below. Only for free text;
         # a query of operators alone has nothing to look for in it.
         attachment_hits: dict[int, Any] = {}
         attachments_note = None
-        if has_text:
+        if has_text and keyword_active:
             try:
                 import mail_attachments
 
-                allowed = None
-                filters = conditions[fts_conditions:]
-                if filters or name_clause:
-                    # Filters (dates, account, operators) apply to messages, not
-                    # to attachments: capping by bm25 first would drop the hits
-                    # of a narrow filter. Restrict the attachment query to the
-                    # matching message ids instead (or, when they are too many
-                    # to pass along, widen the cap and filter afterwards).
-                    id_conditions = list(filters)
-                    id_parameters = list(parameters[fts_conditions:])
-                    if name_clause:
-                        id_conditions.append("m.id IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)")
-                        id_parameters.append(name_clause)
-                    ids = [row[0] for row in connection.execute(
-                        "SELECT m.id FROM messages m WHERE " + " AND ".join(id_conditions) + " LIMIT ?",
-                        (*id_parameters, ATTACHMENT_ID_LIMIT + 1),
-                    )]
-                    if len(ids) <= ATTACHMENT_ID_LIMIT:
-                        allowed = ids
-                narrow = bool(filters or name_clause) and allowed is None
+                allowed, narrow = id_scope()
                 attachment_hits = {
                     hit.message: hit
                     for hit in mail_attachments.search_hits(
@@ -479,51 +714,64 @@ def search_all(
                 }
             except (sqlite3.DatabaseError, MailError) as error:
                 attachments_note = f"attachment text not searched: {error}"
-        wide = min(200, limit * 3) if attachment_hits else limit
-        if sort == "date":
-            order = "m.date_received DESC"
-            order_parameters: list[Any] = []
-        else:
-            weights = ", ".join(str(weight) for weight in BM25_WEIGHTS)
-            # bm25() is negative, the more negative the better, so a positive
-            # multiplier above 1 improves a match. Ties fall back to newest.
-            order = (
-                f"bm25(messages_fts, {weights})"
-                " * (1 + ? / (1 + max(? - coalesce(m.date_received, 0), 0) / 86400.0 / ?)),"
-                " m.date_received DESC"
-            )
-            order_parameters = [RECENCY_BOOST, int(time.time()), RECENCY_HALF_LIFE_DAYS]
-        source = "messages_fts f JOIN messages m ON m.id = f.rowid" if use_fts else "messages m"
-        where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
-        score_column = (
-            f", bm25(messages_fts, {', '.join(str(weight) for weight in BM25_WEIGHTS)}) AS bm25_score"
-            if use_fts else ""
-        )
-        statement = (
-            "SELECT m.id, m.account, m.subject, m.sender, m.date_received, m.rfc_id,"
-            f"       m.has_attachment, m.is_bulk{score_column}"
-            f"  FROM {source}{where}"
-            f" ORDER BY {order} LIMIT ?"
-        )
+
+        rows = []
         used_query = query
-        try:
-            rows = connection.execute(statement, (*parameters, *order_parameters, wide)).fetchall()
-        except sqlite3.OperationalError as error:
-            if not has_text:
-                raise MailError("invalid_query", f"Unusable query: {error}") from error
-            # The query was not valid FTS5 syntax; retry with the words quoted.
-            used_query = _quote_terms(query)
-            parameters[0] = match_expression(used_query)
+        if keyword_active:
+            wide = min(200, keyword_limit * 3) if attachment_hits else keyword_limit
+            if keyword_sort == "date":
+                order = "m.date_received DESC"
+                order_parameters: list[Any] = []
+            else:
+                weights = ", ".join(str(weight) for weight in BM25_WEIGHTS)
+                # bm25() is negative, the more negative the better, so a positive
+                # multiplier above 1 improves a match. Ties fall back to newest.
+                order = (
+                    f"bm25(messages_fts, {weights})"
+                    " * (1 + ? / (1 + max(? - coalesce(m.date_received, 0), 0) / 86400.0 / ?)),"
+                    " m.date_received DESC"
+                )
+                order_parameters = [RECENCY_BOOST, int(time.time()), RECENCY_HALF_LIFE_DAYS]
+            source = "messages_fts f JOIN messages m ON m.id = f.rowid" if use_fts else "messages m"
+            where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+            score_column = (
+                f", bm25(messages_fts, {', '.join(str(weight) for weight in BM25_WEIGHTS)}) AS bm25_score"
+                if use_fts else ""
+            )
+            statement = (
+                "SELECT m.id, m.account, m.subject, m.sender, m.date_received, m.rfc_id,"
+                f"       m.has_attachment, m.is_bulk{score_column}"
+                f"  FROM {source}{where}"
+                f" ORDER BY {order} LIMIT ?"
+            )
+            used_query = query
             try:
                 rows = connection.execute(statement, (*parameters, *order_parameters, wide)).fetchall()
             except sqlite3.OperationalError as error:
-                raise MailError("invalid_query", f"Unusable query: {error}") from error
+                if not has_text:
+                    raise MailError("invalid_query", f"Unusable query: {error}") from error
+                # The query was not valid FTS5 syntax; retry with the words quoted.
+                used_query = _quote_terms(query)
+                parameters[0] = match_expression(used_query)
+                try:
+                    rows = connection.execute(statement, (*parameters, *order_parameters, wide)).fetchall()
+                except sqlite3.OperationalError as error:
+                    raise MailError("invalid_query", f"Unusable query: {error}") from error
 
-        if attachment_hits:
-            rows = _merge_attachment_hits(
-                connection, rows, attachment_hits, conditions[fts_conditions:], parameters[fts_conditions:],
-                name_clause, sort, limit,
+            if attachment_hits:
+                rows = _merge_attachment_hits(
+                    connection, rows, attachment_hits, conditions[fts_conditions:], parameters[fts_conditions:],
+                    name_clause, keyword_sort, keyword_limit,
+                )
+
+
+        if semantic is not None:
+            rows = _fuse(
+                connection, rows, semantic, effective, conditions[fts_conditions:], parameters[fts_conditions:],
+                name_clause, limit, sort,
             )
+        else:
+            rows = [dict(row) for row in rows][:limit]
 
         sizes = _mailbox_sizes(connection)
         store = _mail_store() if snippets else None
@@ -567,18 +815,30 @@ def search_all(
             hit = attachment_hits.get(row["id"])
             if hit is not None:
                 messages[-1]["attachment_match"] = {"filename": hit.filename}
+            if row.get("match"):
+                messages[-1]["match"] = row["match"]
+                if "similarity" in row:
+                    messages[-1]["similarity"] = round(row["similarity"], 3)
             if snippets:
-                messages[-1]["snippet"] = _snippet(store, row["id"], used_query)
+                if row.get("match") == "semantic":
+                    # Nothing to anchor on: the chunk that matched is the excerpt.
+                    import mail_vectors
+
+                    messages[-1]["snippet"] = mail_vectors.chunk_excerpt(
+                        store, row["id"], row["subject"] or "", row["chunk"])
+                else:
+                    messages[-1]["snippet"] = _snippet(store, row["id"], used_query)
                 if hit is not None:
                     excerpt = _attachment_snippet(hit, used_query)
                     messages[-1]["attachment_match"]["snippet"] = excerpt
-                    if row["only_attachment"]:
+                    if row.get("only_attachment"):
                         messages[-1]["snippet"] = f"[attachment: {hit.filename}] {excerpt or ''}".strip()
 
         result: dict[str, Any] = {
             "ok": True,
             "query": query,
             "sort": sort,
+            "mode": effective,
             "filters": mail_operators.describe(parsed.filters),
             "messages": messages,
             "indexed_messages": connection.execute(
@@ -589,6 +849,8 @@ def search_all(
         }
         if attachments_note:
             result["attachments_note"] = attachments_note
+        if semantic_note:
+            result["semantic_note"] = semantic_note
         if used_query != query:
             result["interpreted_as"] = used_query
         if parsed.filters:
@@ -941,6 +1203,14 @@ def sync_index(timeout: int = 900) -> dict[str, Any]:
             result["attachments_sync"] = "started in the background"
     except Exception:  # noqa: BLE001 - the message sync already succeeded
         pass
+    # Same for the embeddings of new mail (Ollama, minutes for a busy day).
+    try:
+        import mail_vectors
+
+        if mail_vectors.start_background_sync():
+            result["vectors_sync"] = "started in the background"
+    except Exception:  # noqa: BLE001 - the message sync already succeeded
+        pass
     if purged:
         result["purged_drafts"] = purged
     return result
@@ -952,6 +1222,16 @@ def _attachments_status() -> dict[str, Any]:
         import mail_attachments
 
         return mail_attachments.status()
+    except Exception as error:  # noqa: BLE001 - a side index must not break the status
+        return {"built": False, "note": str(error)}
+
+
+def _vectors_status(indexed_messages: int) -> dict[str, Any]:
+    """The embeddings (search by meaning) in a few numbers; never an error."""
+    try:
+        import mail_vectors
+
+        return mail_vectors.status(indexed_messages)
     except Exception as error:  # noqa: BLE001 - a side index must not break the status
         return {"built": False, "note": str(error)}
 
@@ -1003,6 +1283,7 @@ def index_status() -> dict[str, Any]:
             "database": INDEX_PATH,
             "size_mb": round(os.path.getsize(INDEX_PATH) / 1024 / 1024),
             "attachments": _attachments_status(),
+            "vectors": _vectors_status(messages),
         }
     finally:
         connection.close()

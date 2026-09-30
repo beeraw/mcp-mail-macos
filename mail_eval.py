@@ -11,6 +11,7 @@ and reports where the expected message landed.
     python3 mail_eval.py --run --save-baseline before
     python3 mail_eval.py --run --compare before      # deltas, regressions
     python3 mail_eval.py --run --inflect             # queries in another inflected form
+    python3 mail_eval.py --run --mode hybrid         # keyword, semantic or hybrid (needs mail_vectors.py)
 
 The index is only ever opened read-only, and a run never triggers a sync: a
 sync in the middle of a measurement would change the corpus under it.
@@ -601,10 +602,13 @@ def inflect_query(query: str) -> str:
     return WORD_PATTERN.sub(lambda match: inflect_word(match.group(0)), query)
 
 
-def run_pairs(pairs: list[dict[str, Any]], inflect: bool = False) -> dict[str, Any]:
+def run_pairs(pairs: list[dict[str, Any]], inflect: bool = False, mode: str | None = None) -> dict[str, Any]:
     """Runs every pair through search_all and ranks the expected message.
 
-    With inflect=True each query is first rewritten by inflect_query.
+    With inflect=True each query is first rewritten by inflect_query. `mode` is
+    search_all's ("keyword", "semantic", "hybrid"); None leaves the configured
+    default. A hybrid query that fell back to keywords (Ollama down) is counted
+    in "fallbacks": such a run measures keyword search, not what it claims.
 
     A MailError (index missing, ...) affects every query, so it aborts the run.
     Any other failure is specific to one query and is counted as an error.
@@ -613,6 +617,8 @@ def run_pairs(pairs: list[dict[str, Any]], inflect: bool = False) -> dict[str, A
     from mail_tools import MailError
 
     rows = []
+    fallbacks = 0
+    options = {"mode": mode} if mode else {}
     for pair in pairs:
         row = {
             "query": pair["query"],
@@ -622,7 +628,8 @@ def run_pairs(pairs: list[dict[str, Any]], inflect: bool = False) -> dict[str, A
         }
         try:
             answer = mail_search.search_all(
-                query=inflect_query(pair["query"]) if inflect else pair["query"], limit=SEARCH_LIMIT, max_age_minutes=NEVER_SYNC
+                query=inflect_query(pair["query"]) if inflect else pair["query"], limit=SEARCH_LIMIT, max_age_minutes=NEVER_SYNC,
+                **options,
             )
         except MailError as error:
             if error.code == "invalid_query":
@@ -636,8 +643,11 @@ def run_pairs(pairs: list[dict[str, Any]], inflect: bool = False) -> dict[str, A
             continue
         found = [message["mail_id"] for message in answer["messages"]]
         row["rank"] = rank_of(pair["expected"], found)
+        if answer.get("semantic_note"):
+            fallbacks += 1
         rows.append(row)
-    return {"aggregate": aggregate_rows(rows), "by_kind": aggregate_by_kind(rows), "pairs": rows}
+    return {"aggregate": aggregate_rows(rows), "by_kind": aggregate_by_kind(rows), "pairs": rows,
+            "mode": mode or "default", "fallbacks": fallbacks}
 
 
 # --------------------------------------------------------------------------
@@ -695,6 +705,9 @@ def main() -> int:
     parser.add_argument("--run", action="store_true", help="run every pair and report ranks")
     parser.add_argument("--inflect", action="store_true",
                         help="rewrite each query word to another inflected form (measures stemming)")
+    parser.add_argument("--mode", choices=("keyword", "semantic", "hybrid"),
+                        help="search mode for --run (default: the search_mode setting); semantic and hybrid "
+                             "need the vectors file (mail_vectors.py) and Ollama")
     parser.add_argument("--json", action="store_true", help="machine-readable output for --run")
     parser.add_argument("--save-baseline", metavar="NAME", help="store this run as eval/results/NAME.json")
     parser.add_argument("--compare", metavar="NAME", help="show deltas against a stored run")
@@ -778,8 +791,11 @@ def _main(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> int
     if not pairs:
         print(f"No pairs in {arguments.pairs}. Run --generate first.", file=sys.stderr)
         return 1
-    result = run_pairs(pairs, inflect=arguments.inflect)
+    result = run_pairs(pairs, inflect=arguments.inflect, mode=arguments.mode)
     result["inflect"] = arguments.inflect
+    if result["fallbacks"]:
+        print(f"WARNING: {result['fallbacks']} query(ies) fell back to keyword search "
+              "(semantic search unavailable): this run is not a clean measure of the mode.", file=sys.stderr)
 
     comparison = None
     if arguments.compare:

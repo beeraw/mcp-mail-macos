@@ -70,6 +70,25 @@ DEFAULTS: dict[str, Any] = {
     # Named searches (the saved_search tool). Empty means saved_searches.json
     # beside the search index; it is gitignored, and holds queries, not mail.
     "saved_searches_path": "",
+    # Search by meaning (mail_vectors.py). Everything here is optional: without
+    # Ollama or the vectors file, search_all behaves as keyword search.
+    # Where the embeddings live. Empty means vectors.sqlite beside the search
+    # index, so a scratch index_path keeps its vectors out of the real ones.
+    "vectors_path": "",
+    # Ollama's endpoint and the embedding model asked of it (1024 dimensions for
+    # bge-m3). Changing the model needs mail_vectors.py --build again.
+    "ollama_url": "http://localhost:11434",
+    "embedding_model": "bge-m3",
+    # Seconds granted to Ollama for embedding a query before search_all gives
+    # up on the meaning and answers with keywords alone.
+    "ollama_timeout": 5,
+    # Mode of search_all when the caller gives none: "keyword" (exact words,
+    # the historical behaviour), or "auto" (hybrid when the vectors exist and
+    # cover the index, keyword otherwise).
+    "search_mode": "keyword",
+    # After a message sync run from search_all / sync_index, start
+    # mail_vectors.py --sync in the background (only once the vectors exist).
+    "vectors_auto_sync": True,
 }
 
 _FILE_VALUES: dict[str, Any] | None = None

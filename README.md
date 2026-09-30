@@ -30,6 +30,7 @@ accounts, on a mailbox of roughly 50,000 messages spanning several years.
 - [The 26 tools](#the-26-tools)
 - [Drafts are files, not Mail drafts](#drafts-are-files-not-mail-drafts)
 - [The search index](#the-search-index)
+  - [Search by meaning](#search-by-meaning)
 - [Message identifiers](#message-identifiers)
 - [Response format](#response-format)
 - [Known limitations](#known-limitations)
@@ -104,6 +105,22 @@ import picks whichever is installed:
 
 The decorator API is identical between the two, so nothing else changes.
 
+One more, **optional**, in `requirements-semantic.txt`:
+
+```
+sqlite-vec>=0.1.6
+```
+
+It computes cosine similarity inside SQLite for search by meaning
+([below](#search-by-meaning)), and is imported only when that feature runs.
+Without it the server, the index and keyword search are untouched; semantic
+search then compares vectors in plain Python, which is fine for a filtered
+search and refused (with a hint) for a whole-mailbox one. Search by meaning also
+needs [Ollama](https://ollama.com) running locally with the `bge-m3` model
+(`brew install ollama`, `brew services start ollama`, `ollama pull bge-m3`,
+about 1.2 GB); it is reached over HTTP with `urllib`, nothing to install in
+Python.
+
 **Everything else is standard library** — `sqlite3` for the index and its FTS5
 tables, `email` for parsing `.emlx` containers and writing `.eml` drafts,
 `subprocess` for `osascript`, `unicodedata`, `urllib.parse`, `json`, `tempfile`.
@@ -121,6 +138,7 @@ git clone https://github.com/beeraw/mcp-mail-macos.git
 cd mcp-mail-macos
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
+.venv/bin/pip install -r requirements-semantic.txt   # optional: search by meaning
 ```
 
 ---
@@ -248,6 +266,12 @@ claude mcp add mail-macos -s user -e MAIL_MCP_DRAFTS_FOLDER="$HOME/Documents/Out
 | `attachments_char_limit` | `100000` | Characters kept per attachment |
 | `attachments_auto_sync` | `true` | After a message sync, start the attachment sync in the background (once that index exists) |
 | `saved_searches_path` | beside `index_path` | The named searches of `saved_search`, `saved_searches.json` (gitignored) |
+| `vectors_path` | beside `index_path` | The embeddings for search by meaning, `vectors.sqlite` (gitignored) |
+| `ollama_url` | `http://localhost:11434` | Where Ollama listens |
+| `embedding_model` | `bge-m3` | The model asked to embed text; changing it needs `mail_vectors.py --build` |
+| `ollama_timeout` | `5` | Seconds allowed to embed a query before `search_all` answers with keywords alone |
+| `search_mode` | `keyword` | `search_all`'s mode when the caller gives none: `keyword`, or `auto` (hybrid once the vectors exist and cover the index) |
+| `vectors_auto_sync` | `true` | After a message sync, start `mail_vectors.py --sync` in the background (once the vectors exist) |
 
 The `launchd` agent is the one place a path cannot come from configuration:
 launchd needs absolute paths in the plist itself. Replace `/ABSOLUTE/PATH/TO`
@@ -261,11 +285,11 @@ in `launchd/com.mcp-mail-macos.sync.plist` before installing it.
 
 | Tool | Purpose |
 | --- | --- |
-| `search_all(query, account, mailbox, unread_only, flagged_only, since, until, limit, sort, snippets)` | Search every account, through the local index |
+| `search_all(query, account, mailbox, unread_only, flagged_only, since, until, limit, sort, snippets, mode)` | Search every account, through the local index; `mode` adds search by meaning |
 | `aggregate(group_by, query, account, mailbox, unread_only, flagged_only, since, until, limit, order)` | Count matching messages per sender, domain, month, year, account, mailbox or recipient ("who writes to me most", volumes per month) |
 | `saved_search(action, name, description, query, account, mailbox, unread_only, flagged_only, since, until, limit, sort, snippets)` | Save a frequent search under a name (`save`), re-run it (`run`, with optional overrides), or `list` / `show` / `delete` saved ones |
 | `get_thread(message_id, limit)` | The whole conversation a message belongs to |
-| `index_status()` | What the index holds, how old it is, how many messages have a searchable body (per account and overall), and the state of the attachment index |
+| `index_status()` | What the index holds, how old it is, how many messages have a searchable body (per account and overall), and the state of the attachment and vector indexes |
 | `sync_index()` | Bring the index up to date |
 
 `search_all` covers the whole archive in milliseconds. Subject, sender,
@@ -713,6 +737,105 @@ Measured on a mailbox of about 54,000 messages and 34,000 attachment files on di
 about 30 ms a file, scanned PDF OCR about 350 ms, Word and Excel a few ms, images
 about 60 ms. A full first run takes on the order of half an hour.
 
+### Search by meaning
+
+Keyword search finds the words you typed. `search_all(..., mode="semantic")`
+finds the messages that are *about* what you typed ("unpaid bills" finds a
+"payment reminder"), and `mode="hybrid"` fuses both rankings. It is optional:
+without the vectors file, Ollama or `sqlite-vec`, everything above behaves
+exactly as before.
+
+| `mode` | What runs |
+| --- | --- |
+| `keyword` | The search described above (bm25, attachments, stemming). |
+| `semantic` | The query is embedded and compared with the message chunks; no keyword involved. Fails with a hint when it cannot run. |
+| `hybrid` | Both, then Reciprocal Rank Fusion (`k = 60`): a message scores the sum of `1 / (60 + rank)` over the rankings that hold it. Falls back to keyword, with a `semantic_note` in the answer, when it cannot run. |
+| omitted | The `search_mode` setting: `keyword` (the default), or `auto` = hybrid when the vectors are fresh (built with this recipe, covering at least 95 % of the index, `sqlite-vec` loadable), keyword otherwise. |
+
+Each result of `semantic` and `hybrid` carries `match` (`keyword`, `semantic` or
+`both`) and, when meaning found it, `similarity` (cosine of its best chunk). A
+result found only by meaning has no matched word to anchor a snippet on, so its
+snippet is the passage that matched. Everything that narrows a keyword search
+narrows this one too: operators, dates, account, mailbox. The filters are
+applied before the nearest-neighbour cut, so a narrow filter never loses its hits
+to the global top. `sort="date"` reorders the fused best matches newest first.
+With free text absent (operators alone) there is nothing to embed and the search
+is a keyword one.
+
+Building the vectors, once, then keeping them current:
+
+```bash
+brew install ollama && brew services start ollama && ollama pull bge-m3
+.venv/bin/pip install -r requirements-semantic.txt
+python3 mail_vectors.py --build    # from scratch; --sync resumes and only does what is new
+python3 mail_vectors.py --status
+```
+
+What is embedded: the subject and the message's own text (quoted history already
+cut, links and tokens over 40 characters dropped), in chunks of about 1,000
+characters with 150 overlapping, at most 8 per message, so a long thread is
+represented by its first 8,000 characters or so. The subject is added to the first
+chunk. A message with no readable body is embedded by its subject alone. The file
+holds the vector, the chunk number and a hash of the text, never the text: an
+excerpt is cut again from the message when needed. `--sync` skips a message
+already embedded without reading it (`--verify` reads them again and re-embeds
+those whose text changed), deletes the vectors of messages the index dropped,
+commits every batch of 32 chunks (an interrupted run, SIGTERM included, resumes
+where it stopped) and takes `vectors.sqlite.sync.lock`, independent of the
+index's. `--sample PERCENT --seed N` embeds a reproducible random subset, for
+measurements. Once the file exists, every successful `sync_index` starts
+`--sync` in the background (`vectors_auto_sync`); a search never waits for it.
+
+Measured on a mailbox of about 50,700 messages (Apple silicon, bge-m3 in Ollama):
+
+| | |
+| --- | --- |
+| Chunks | 70,946: 1.4 per message; 91 % of messages take one or two, 1 % reach the cap of 8, 141 empty ones none |
+| Full build | 36 minutes: about 33 chunks a second whatever the batch size from 4 up (16 to 64 measured), 32 per request; the .emlx reading (about 2 minutes for the whole mailbox) is negligible next to it |
+| File size | 96 MB (int8, 1 KB a chunk); float32 would be about 4 times larger |
+| Quantisation | int8, one scale per vector. Against float32, 99.3 % of the top 10 neighbours are kept; a binary quantisation (128 bytes a chunk) keeps 66 % and was rejected |
+| Query latency | embedding a query 11 ms once the model is loaded (0.8 s when Ollama has to load it again, after 30 minutes idle); `keyword` 24 ms, `semantic` 110 ms, `hybrid` 124 ms, of which about 75 ms is the comparison with the 71,000 chunks (sqlite-vec, exact, no approximate index) |
+
+The vectors are plain int8 blobs in an ordinary table compared with sqlite-vec's
+scalar functions, not a `vec0` virtual table: `vec0` does the same exact scan (95 ms
+against 89 ms for 125,000 chunks), but its contents cannot be read without the
+extension and it cannot be restricted by message id, both of which the Python
+fallback and the filters need. The embedding call has a 5 second timeout
+(`ollama_timeout`); after a failure Ollama is not asked again for a minute, so a
+search never pays the timeout twice, and `hybrid` answers with keywords and says
+why in `semantic_note`.
+
+How well it works, on the pairs of [Evaluating search quality](#evaluating-search-quality)
+(550 pairs, `mail_eval.py --run --mode ...`; MRR / recall@10). These pairs are two or
+three words of a message, so they measure exact words, which keyword search is built
+for; semantic search is not expected to win there, and attachment text is not embedded.
+
+| Mode | Pairs as drawn | Query words inflected (`--inflect`) |
+| --- | --- | --- |
+| `keyword` | 0.467 / 0.747 | 0.330 / 0.547 |
+| `semantic` | 0.102 / 0.204 | 0.092 / 0.173 |
+| `hybrid` | 0.440 / 0.744 | 0.358 / 0.593 |
+
+Hybrid uses the semantic ranking at a quarter of the weight of the keyword one
+(`RRF_SEMANTIC_WEIGHT`). With equal weights, the loose neighbours of a short query
+pushed exact matches down (MRR 0.410 on the pairs as drawn). Weights from 1 to 0.15,
+a minimum similarity and a cap on the semantic list were tried on the same pairs;
+0.25 without threshold kept recall@10 level with keyword and gained on inflected
+queries (subject pairs: recall@10 0.465 to 0.580, 40 fewer misses out of 200). The
+price is a lower first place on exact words (MRR minus 0.026), which is why
+`keyword` stays the default: it is right for the most frequent kind of query, needs
+no Ollama and answers in 24 ms. Search by meaning is where words differ, for
+instance a query in English finds French mail about "unpaid bills" (a keyword search
+finds nothing); use `mode="hybrid"` or `"semantic"` for those, or set
+`search_mode` to `auto` if you prefer it everywhere.
+
+
+Attachments are not embedded in this version. Their text is the largest volume
+of the mailbox (a PDF alone can hold a hundred thousand characters), it is often
+noise for a language model (letterheads, tables, OCR of stamps), and keyword
+search already reaches it: in `hybrid` the keyword side still merges attachment
+hits, so a message found through an attachment word stays in the fused list.
+
 ### Evaluating search quality
 
 `mail_eval.py` measures where search puts the message you were looking for, so a
@@ -725,6 +848,7 @@ python3 mail_eval.py --attach 100 --seed 3          # add pairs from attachment 
 python3 mail_eval.py --run                          # rank of each expected message
 python3 mail_eval.py --run --save-baseline before   # keep the numbers
 python3 mail_eval.py --run --compare before         # deltas, and pairs that got worse
+python3 mail_eval.py --run --mode hybrid            # keyword, semantic or hybrid (needs the vectors)
 ```
 
 A pair is a query and the message it should find. `--generate` derives the query
@@ -949,6 +1073,7 @@ mcp-mail-macos/
 ├── mail_index.py       # building and updating the index
 ├── mail_stem.py        # French light stemmer and query rewrite
 ├── mail_attachments.py # attachment text: extractors, attachments.sqlite, sync
+├── mail_vectors.py     # embeddings for search by meaning: vectors.sqlite, Ollama client, sync
 ├── mail_eval.py        # search relevance evaluation (pairs, MRR, recall)
 ├── test_manual.py      # manual checks against a real Mail install
 ├── tools/              # Swift sources (PDFKit text, Vision OCR), compiled into tools/build/
@@ -958,6 +1083,7 @@ mcp-mail-macos/
 │   └── …
 ├── launchd/            # optional periodic sync agent
 ├── requirements.txt
+├── requirements-semantic.txt   # optional: sqlite-vec
 └── README.md
 ```
 
