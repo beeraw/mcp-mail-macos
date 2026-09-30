@@ -30,3 +30,11 @@ config.json
 # Search evaluation pairs and results hold real message subjects
 # (see eval.example.json for the format)
 eval/
+
+# Swift tools build output (see mail_attachments.py)
+tools/build/
+attachments.sqlite
+attachments.sqlite-wal
+attachments.sqlite-shm
+attachments.sqlite.sync.lock
+attachments.sqlite.sync.lock.stale.*

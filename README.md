@@ -242,6 +242,11 @@ claude mcp add mail-macos -s user -e MAIL_MCP_DRAFTS_FOLDER="$HOME/Documents/Out
 | `applescript_timeout` | `120` | Ceiling for a read call, in seconds |
 | `applescript_write_timeout` | `180` | Ceiling for a send or move |
 | `body_limit` | `200000` | Characters of body kept per message when indexing |
+| `attachments_path` | beside `index_path` | The attachment text index, `attachments.sqlite` |
+| `attachments_ocr_images` | `true` | OCR of loose images (at least 50 KB, not named like a logo); scanned PDFs are always read |
+| `attachments_max_mb` | `20` | Largest attachment read: PDFs up to this, other types up to half |
+| `attachments_char_limit` | `100000` | Characters kept per attachment |
+| `attachments_auto_sync` | `true` | After a message sync, start the attachment sync in the background (once that index exists) |
 
 The `launchd` agent is the one place a path cannot come from configuration:
 launchd needs absolute paths in the plist itself. Replace `/ABSOLUTE/PATH/TO`
@@ -257,7 +262,7 @@ in `launchd/com.mcp-mail-macos.sync.plist` before installing it.
 | --- | --- |
 | `search_all(query, account, mailbox, unread_only, flagged_only, since, until, limit, sort, snippets)` | Search every account, through the local index |
 | `get_thread(message_id, limit)` | The whole conversation a message belongs to |
-| `index_status()` | What the index holds, how old it is, and how many messages have a searchable body (per account and overall) |
+| `index_status()` | What the index holds, how old it is, how many messages have a searchable body (per account and overall), and the state of the attachment index |
 | `sync_index()` | Bring the index up to date |
 
 `search_all` covers the whole archive in milliseconds. Subject, sender,
@@ -318,6 +323,12 @@ missing or not downloaded. `sort="date"` returns the newest matches first instea
 bonus are constants at the top of `mail_search.py`. The command-line
 `python3 mail_index.py --search QUERY` ranks the same way, `--sort date` to
 order by date.
+
+When the attachment index exists, the text of PDFs, Word, Excel, PowerPoint and
+scans is searched too (see [Attachment text](#attachment-text)). A message found
+only through an attachment carries `attachment_match` (`filename`, and a
+`snippet` of the attachment when snippets are on), and its `snippet` starts with
+`[attachment: name]`. Without `attachments.sqlite` nothing changes.
 
 `get_thread` uses the conversation grouping Mail computes itself, carried in the
 index. The whole exchange comes back, including replies filed in another mailbox
@@ -595,6 +606,92 @@ The agent is only worth it if the index must stay current with no client
 running. Otherwise `search_all`'s own freshness check is enough, and the grant
 stays scoped to a single application.
 
+### Attachment text
+
+Attachment *names* are always indexed. Their *text* lives in a second database,
+`attachments.sqlite`, built by `mail_attachments.py`. It is separate on purpose:
+it is large (text of tens of thousands of files), it is rebuilt on its own
+schedule, and search works exactly as before when it is absent or broken.
+
+```bash
+python3 mail_attachments.py --sync      # first run reads everything; later ones only what is new
+python3 mail_attachments.py --build     # start from scratch
+python3 mail_attachments.py --status    # rows by status, size, last run
+python3 mail_attachments.py --measure   # time the extractors on a random sample
+```
+
+Where the files are: Mail keeps the attachments of a message it has not fully
+downloaded (`.partial.emlx`) as plain files in
+`<mailbox>.mbox/<store>/Data/<shard>/Attachments/<id>/<part>/<file>`, and those of
+a full `.emlx` inside its MIME. Both are read; a MIME part is written to a private
+temporary directory (`mkdtemp`, mode 0700, outside the repository) for the length
+of one batch and removed after it, on exit and on SIGTERM. Nothing is written
+under `~/Library/Mail`, and Full Disk Access is needed as for the index.
+
+What is read, and how:
+
+| Kind | Method | Rule |
+| --- | --- | --- |
+| PDF | PDFKit text layer (`tools/pdftext.swift`) | up to 50 pages, `attachments_max_mb` |
+| Scanned PDF (under 20 characters of text) | Vision OCR, fr-FR + en-US, accurate (`tools/ocr.swift`) | first 3 pages |
+| docx, xlsx, xlsm, pptx | zip + XML (numbers are left out of sheets) | half of `attachments_max_mb` |
+| doc | `textutil` | same |
+| png, jpg, jpeg, heic, tiff | Vision OCR | at least 50 KB, name not a logo, banner, signature, social icon or `imageNNN`; off with `attachments_ocr_images` |
+| zip, rar, dwg, audio, video, gif, xls, anything else | skipped | recorded with the reason |
+
+The Swift tools are compiled on first use into `tools/build/` (gitignored) with
+`/usr/bin/swiftc`, and again whenever their source is newer; a missing compiler
+is reported with `xcode-select --install`. Each takes many files per call, so the
+process start is paid once. A tool that stays silent for 40 s is killed; the file
+it choked on is marked `error` and the rest of the batch goes again.
+
+Resumable: discovery first records every attachment as a row (`pending`, or
+`skipped` / `too_big` with a reason), then the pending rows are read in batches of
+40 with a commit each. Kill the run at any point and run `--sync` again: it picks up
+the remaining rows. A row is read again when its size or modification time
+changes (`--retry-errors` retries failures); rows of messages that left Mail, and
+of files that disappeared, are deleted. Changing a setting (OCR on or off)
+reclassifies the skipped rows on the next run. A run takes `attachments.sqlite.sync.lock`,
+independent of the index lock: the two syncs can run at once, since the
+attachment one reads Mail's files, not the index.
+
+| Column | Meaning |
+| --- | --- |
+| `status` | `pending`, `ok`, `empty` (no text found), `skipped`, `too_big`, `error` |
+| `reason` | why skipped or failed: `type`, `small_image`, `decoration`, `ocr_off`, `encrypted`, `tool_failed`... |
+| `method` | `text`, `ocr`, `office`, `textutil` |
+| `text` | the extracted text, one line, capped at `attachments_char_limit` |
+
+`attachments_fts(filename, text, filename_stem, text_stem)` is contentless like the
+message table, with the same French stemming; the text itself stays in
+`attachments.text` for snippets.
+
+How search uses it: `search_all` runs the free text against the message index as
+before, then against `attachments_fts` (bm25 with the file name counting three
+times the text), and merges by message. A message found by both gets its own
+recency-adjusted score plus `ATTACHMENT_WEIGHT` (0.5) times the attachment's; a
+message found only through an attachment is ranked by that half score. Attachment
+hits go through the same filters as any result (operators, dates, account,
+mailbox, `filename:`), so an attachment never bypasses them. A query restricted
+to a message field (`subject:`, `sender:`...) leaves attachments out;
+`sort="date"` orders the merged set by date. `has:attachment` is unchanged and
+`filename:` still matches the names in the message index.
+
+Keeping it current: a search never waits for attachments (reading them takes
+minutes). Instead, once `attachments.sqlite` exists, every successful
+`sync_index` (and so every stale-index refresh from `search_all`) starts
+`mail_attachments.py --sync` detached in the background; if one is already
+running the new one exits at once. Set `attachments_auto_sync` to `false` to
+turn that off and run it yourself, or from launchd next to the message sync
+(copy `launchd/com.mcp-mail-macos.sync.plist`, replace its `--sync` program by
+`mail_attachments.py --sync`, and the same Full Disk Access caveat applies).
+`index_status` reports `attachments`: rows by status, size and last run.
+
+Measured on a mailbox of about 54,000 messages and 34,000 attachment files on disk
+(plus about 13,500 named parts inside full messages), on Apple silicon: PDF text
+about 30 ms a file, scanned PDF OCR about 350 ms, Word and Excel a few ms, images
+about 60 ms. A full first run takes on the order of half an hour.
+
 ### Evaluating search quality
 
 `mail_eval.py` measures where search puts the message you were looking for, so a
@@ -603,6 +700,7 @@ It opens the index read-only and never syncs during a run.
 
 ```bash
 python3 mail_eval.py --generate 200 --seed 1        # pairs from random messages
+python3 mail_eval.py --attach 100 --seed 3          # add pairs from attachment text (keeps the other pairs)
 python3 mail_eval.py --run                          # rank of each expected message
 python3 mail_eval.py --run --save-baseline before   # keep the numbers
 python3 mail_eval.py --run --compare before         # deltas, and pairs that got worse
@@ -615,6 +713,12 @@ not stored in the index, so it is not used. Pairs written by hand
 `eval.example.json` shows the format with made-up data. The report gives MRR,
 recall@1, recall@10 and the number of pairs not found in the top 50. Add `--json`
 for machine output.
+
+`--attach N` adds pairs of a third kind, `attachment`: two or three words that are
+rare in one attachment's text (and not in its message's own fields), expected
+result the message. Alone it redraws only the attachment pairs and keeps every
+other one, so the subject and body numbers stay comparable across runs; the
+report gives one line per kind.
 
 Pairs and results are written under `eval/`, which is gitignored: they contain
 real subjects.
@@ -822,8 +926,10 @@ mcp-mail-macos/
 ├── mail_search.py      # querying the index
 ├── mail_index.py       # building and updating the index
 ├── mail_stem.py        # French light stemmer and query rewrite
+├── mail_attachments.py # attachment text: extractors, attachments.sqlite, sync
 ├── mail_eval.py        # search relevance evaluation (pairs, MRR, recall)
 ├── test_manual.py      # manual checks against a real Mail install
+├── tools/              # Swift sources (PDFKit text, Vision OCR), compiled into tools/build/
 ├── tests/              # unit tests, no Mail required
 ├── applescript/        # one script per operation, plus shared handlers
 │   ├── _common.applescript

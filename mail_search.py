@@ -44,6 +44,16 @@ BM25_WEIGHTS = (10.0, 5.0, 1.0, 1.0, 3.0, 1.0, 3.0, 1.0, 0.25)
 RECENCY_BOOST = 0.3
 RECENCY_HALF_LIFE_DAYS = 365.0
 SORT_MODES = ("relevance", "date")
+# An attachment's text is a weaker witness than the message itself: its bm25
+# (computed in attachments.sqlite, on another corpus) counts for half when it is
+# added to the message's own score, or alone for a message matched only through
+# an attachment.
+ATTACHMENT_WEIGHT = 0.5
+# Attachment hits pulled in before the message filters (dates, accounts,
+# operators) are applied to them.
+ATTACHMENT_CANDIDATES = 300
+# Largest set of message ids handed to the attachment query for a filtered search.
+ATTACHMENT_ID_LIMIT = 50_000
 
 
 def _require_current_schema(connection: sqlite3.Connection) -> None:
@@ -242,6 +252,78 @@ def _snippet(store: str | None, identifier: int, query: str) -> str | None:
         return None
 
 
+def _attachment_snippet(hit: Any, query: str) -> str | None:
+    """Excerpt of the matched attachment's text; None whenever it cannot be had."""
+    import mail_attachments
+    import mail_index
+
+    try:
+        return mail_index.make_snippet(mail_attachments.attachment_text(hit.attachment), query)
+    except Exception:  # noqa: BLE001 - a snippet is a convenience
+        return None
+
+
+def _recency_factor(date_received: int | None) -> float:
+    """The multiplier the relevance ORDER BY applies, for scores computed here."""
+    age_days = max(time.time() - (date_received or 0), 0) / 86400.0
+    return 1 + RECENCY_BOOST / (1 + age_days / RECENCY_HALF_LIFE_DAYS)
+
+
+def _merge_attachment_hits(
+    connection: sqlite3.Connection,
+    rows: list[sqlite3.Row],
+    hits: dict[int, Any],
+    filter_conditions: list[str],
+    filter_parameters: list[Any],
+    name_clause: str,
+    sort: str,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Message rows ranked with what their attachments said.
+
+    `rows` are the messages matched on their own fields. Messages matched only
+    through an attachment are fetched here under the same filters (operators,
+    dates, account...) so an attachment never bypasses them. Relevance: the
+    message's recency-adjusted bm25 plus ATTACHMENT_WEIGHT times the attachment's,
+    both negative, the lowest first. Date: newest first.
+    """
+    merged: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        entry = dict(row)
+        entry["only_attachment"] = False
+        entry["score"] = (entry.pop("bm25_score", 0.0) or 0.0) * _recency_factor(entry["date_received"])
+        merged[entry["id"]] = entry
+
+    missing = [identifier for identifier in hits if identifier not in merged]
+    if missing:
+        conditions = list(filter_conditions)
+        parameters = list(filter_parameters)
+        if name_clause:
+            conditions.append("m.id IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)")
+            parameters.append(name_clause)
+        marks = ",".join("?" * len(missing))
+        conditions.append(f"m.id IN ({marks})")
+        statement = (
+            "SELECT m.id, m.account, m.subject, m.sender, m.date_received, m.rfc_id,"
+            "       m.has_attachment, m.is_bulk FROM messages m WHERE " + " AND ".join(conditions)
+        )
+        for row in connection.execute(statement, (*parameters, *missing)).fetchall():
+            entry = dict(row)
+            entry["only_attachment"] = True
+            entry["score"] = 0.0
+            merged[entry["id"]] = entry
+
+    for identifier, entry in merged.items():
+        hit = hits.get(identifier)
+        if hit is not None:
+            entry["score"] += ATTACHMENT_WEIGHT * hit.score * _recency_factor(entry["date_received"])
+    if sort == "date":
+        ordered = sorted(merged.values(), key=lambda entry: -(entry["date_received"] or 0))
+    else:
+        ordered = sorted(merged.values(), key=lambda entry: (entry["score"], -(entry["date_received"] or 0)))
+    return ordered[:limit]
+
+
 def search_all(
     query: str,
     account: str | None = None,
@@ -303,6 +385,7 @@ def search_all(
         use_fts = has_text or bool(wanted_names)
         conditions: list[str] = ["messages_fts MATCH ?"] if use_fts else []
         parameters: list[Any] = [match_expression(query)] if use_fts else []
+        fts_conditions = len(conditions)
         for name in unwanted_names:
             conditions.append("m.id NOT IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)")
             parameters.append(mail_operators.filename_match(name))
@@ -331,6 +414,42 @@ def search_all(
 
         if not has_text:
             sort = "date"  # no free text, so nothing to rank by
+        # Attachment text: another database, merged below. Only for free text;
+        # a query of operators alone has nothing to look for in it.
+        attachment_hits: dict[int, Any] = {}
+        attachments_note = None
+        if has_text:
+            try:
+                import mail_attachments
+
+                allowed = None
+                filters = conditions[fts_conditions:]
+                if filters or name_clause:
+                    # Filters (dates, account, operators) apply to messages, not
+                    # to attachments: capping by bm25 first would drop the hits
+                    # of a narrow filter. Restrict the attachment query to the
+                    # matching message ids instead (or, when they are too many
+                    # to pass along, widen the cap and filter afterwards).
+                    id_conditions = list(filters)
+                    id_parameters = list(parameters[fts_conditions:])
+                    if name_clause:
+                        id_conditions.append("m.id IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)")
+                        id_parameters.append(name_clause)
+                    ids = [row[0] for row in connection.execute(
+                        "SELECT m.id FROM messages m WHERE " + " AND ".join(id_conditions) + " LIMIT ?",
+                        (*id_parameters, ATTACHMENT_ID_LIMIT + 1),
+                    )]
+                    if len(ids) <= ATTACHMENT_ID_LIMIT:
+                        allowed = ids
+                narrow = bool(filters or name_clause) and allowed is None
+                attachment_hits = {
+                    hit.message: hit
+                    for hit in mail_attachments.search_hits(
+                        query, ATTACHMENT_CANDIDATES * 10 if narrow else ATTACHMENT_CANDIDATES, allowed=allowed)
+                }
+            except (sqlite3.DatabaseError, MailError) as error:
+                attachments_note = f"attachment text not searched: {error}"
+        wide = min(200, limit * 3) if attachment_hits else limit
         if sort == "date":
             order = "m.date_received DESC"
             order_parameters: list[Any] = []
@@ -346,15 +465,19 @@ def search_all(
             order_parameters = [RECENCY_BOOST, int(time.time()), RECENCY_HALF_LIFE_DAYS]
         source = "messages_fts f JOIN messages m ON m.id = f.rowid" if use_fts else "messages m"
         where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+        score_column = (
+            f", bm25(messages_fts, {', '.join(str(weight) for weight in BM25_WEIGHTS)}) AS bm25_score"
+            if use_fts else ""
+        )
         statement = (
             "SELECT m.id, m.account, m.subject, m.sender, m.date_received, m.rfc_id,"
-            "       m.has_attachment, m.is_bulk"
+            f"       m.has_attachment, m.is_bulk{score_column}"
             f"  FROM {source}{where}"
             f" ORDER BY {order} LIMIT ?"
         )
         used_query = query
         try:
-            rows = connection.execute(statement, (*parameters, *order_parameters, limit)).fetchall()
+            rows = connection.execute(statement, (*parameters, *order_parameters, wide)).fetchall()
         except sqlite3.OperationalError as error:
             if not has_text:
                 raise MailError("invalid_query", f"Unusable query: {error}") from error
@@ -362,9 +485,15 @@ def search_all(
             used_query = _quote_terms(query)
             parameters[0] = match_expression(used_query)
             try:
-                rows = connection.execute(statement, (*parameters, *order_parameters, limit)).fetchall()
+                rows = connection.execute(statement, (*parameters, *order_parameters, wide)).fetchall()
             except sqlite3.OperationalError as error:
                 raise MailError("invalid_query", f"Unusable query: {error}") from error
+
+        if attachment_hits:
+            rows = _merge_attachment_hits(
+                connection, rows, attachment_hits, conditions[fts_conditions:], parameters[fts_conditions:],
+                name_clause, sort, limit,
+            )
 
         sizes = _mailbox_sizes(connection)
         store = _mail_store() if snippets else None
@@ -405,8 +534,16 @@ def search_all(
                     "is_bulk": bool(row["is_bulk"]),
                 }
             )
+            hit = attachment_hits.get(row["id"])
+            if hit is not None:
+                messages[-1]["attachment_match"] = {"filename": hit.filename}
             if snippets:
                 messages[-1]["snippet"] = _snippet(store, row["id"], used_query)
+                if hit is not None:
+                    excerpt = _attachment_snippet(hit, used_query)
+                    messages[-1]["attachment_match"]["snippet"] = excerpt
+                    if row["only_attachment"]:
+                        messages[-1]["snippet"] = f"[attachment: {hit.filename}] {excerpt or ''}".strip()
 
         result: dict[str, Any] = {
             "ok": True,
@@ -420,6 +557,8 @@ def search_all(
             "coverage": "all_indexed_mail",
             **freshness,
         }
+        if attachments_note:
+            result["attachments_note"] = attachments_note
         if used_query != query:
             result["interpreted_as"] = used_query
         if parsed.filters:
@@ -567,9 +706,29 @@ def sync_index(timeout: int = 900) -> dict[str, Any]:
         if match:
             refreshed = int(match.group(1))
     result = {"ok": True, "added": added, "removed": removed, "refreshed": refreshed, "log": output[-1000:]}
+    # New mail may carry attachments. Reading them takes minutes, far too long
+    # to wait for, so it runs on its own, and only once the attachment index
+    # exists (someone chose to build it).
+    try:
+        import mail_attachments
+
+        if mail_attachments.start_background_sync():
+            result["attachments_sync"] = "started in the background"
+    except Exception:  # noqa: BLE001 - the message sync already succeeded
+        pass
     if purged:
         result["purged_drafts"] = purged
     return result
+
+
+def _attachments_status() -> dict[str, Any]:
+    """The attachment text index in a few numbers; never an error."""
+    try:
+        import mail_attachments
+
+        return mail_attachments.status()
+    except Exception as error:  # noqa: BLE001 - a side index must not break the status
+        return {"built": False, "note": str(error)}
 
 
 def index_status() -> dict[str, Any]:
@@ -618,6 +777,7 @@ def index_status() -> dict[str, Any]:
             "age_hours": round((time.time() - built_at) / 3600, 1) if built_at else None,
             "database": INDEX_PATH,
             "size_mb": round(os.path.getsize(INDEX_PATH) / 1024 / 1024),
+            "attachments": _attachments_status(),
         }
     finally:
         connection.close()

@@ -17,8 +17,10 @@ import os
 import random
 import socket
 import sqlite3
+import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unicodedata
 import unittest
@@ -27,6 +29,7 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config
+import mail_attachments
 import mail_draft
 import mail_eval
 import mail_files
@@ -2246,6 +2249,29 @@ class IndexLockTests(unittest.TestCase):
                 mail_search.sync_index()
         self.assertEqual(caught.exception.code, "index_busy")
 
+    def test_a_successful_sync_starts_the_attachment_sync_in_the_background(self):
+        completed = mock.Mock(returncode=0, stdout=b"indexed 2 messages\n", stderr=b"")
+        with mock.patch.object(mail_search, "INDEX_PATH", self.database), \
+                mock.patch("subprocess.run", return_value=completed), \
+                mock.patch.object(mail_files, "purge_drafts", return_value={"removed": []}), \
+                mock.patch.object(mail_attachments, "start_background_sync", return_value=True) as start:
+            result = mail_search.sync_index()
+        start.assert_called_once()
+        self.assertEqual(result["attachments_sync"], "started in the background")
+
+    def test_the_background_attachment_sync_needs_an_existing_index_and_the_setting(self):
+        path = os.path.join(self.directory.name, "attachments.sqlite")
+        with mock.patch.object(mail_attachments, "database_path", lambda: path), \
+                mock.patch.object(mail_attachments.subprocess, "Popen") as popen:
+            self.assertFalse(mail_attachments.start_background_sync())
+            open(path, "w").close()
+            self.assertTrue(mail_attachments.start_background_sync())
+            self.assertEqual(popen.call_args.kwargs["start_new_session"], True)
+            popen.reset_mock()
+            with mock.patch.dict(os.environ, {"MAIL_MCP_ATTACHMENTS_AUTO_SYNC": "0"}):
+                self.assertFalse(mail_attachments.start_background_sync())
+            popen.assert_not_called()
+
     def test_search_reports_file_without_message_table(self):
         sqlite3.connect(self.database).close()
         with mock.patch.object(mail_search, "INDEX_PATH", self.database):
@@ -2742,6 +2768,540 @@ class StemmedSnippetTests(unittest.TestCase):
     def test_a_different_word_with_the_same_start_is_not_a_hit(self):
         text = self.FILLER * 5 + "Le facteur passe. " + self.FILLER * 5
         self.assertTrue(mail_index.make_snippet(text, "facture").startswith("Lorem"))
+
+
+class AttachmentClassificationTests(unittest.TestCase):
+    def classify(self, name, size=200_000, ocr=True):
+        return mail_attachments.classify(name, size, ocr, 20)
+
+    def test_documents_are_read(self):
+        for name in ("quote.pdf", "plan.DOCX", "budget.xlsx", "old.doc", "deck.pptx"):
+            self.assertEqual(self.classify(name), ("process", None), name)
+
+    def test_archives_cad_and_media_are_skipped_by_type(self):
+        for name in ("all.zip", "drawing.dwg", "clip.mp4", "song.mp3", "legacy.xls"):
+            self.assertEqual(self.classify(name), ("skip", "type"), name)
+
+    def test_size_limits_are_tighter_off_pdf(self):
+        self.assertEqual(self.classify("a.pdf", 15 * 2**20), ("process", None))
+        self.assertEqual(self.classify("a.pdf", 25 * 2**20), ("too_big", None))
+        self.assertEqual(self.classify("a.docx", 15 * 2**20), ("too_big", None))
+
+    def test_images_need_size_and_a_name_that_is_not_decoration(self):
+        self.assertEqual(self.classify("scan.jpg"), ("process", None))
+        self.assertEqual(self.classify("scan.jpg", 10_000), ("skip", "small_image"))
+        self.assertEqual(self.classify("Company logo.png"), ("skip", "decoration"))
+        self.assertEqual(self.classify("image003.png"), ("skip", "decoration"))
+        self.assertEqual(self.classify("IMG_2041.jpg"), ("process", None))
+        self.assertEqual(self.classify("scan.jpg", ocr=False), ("skip", "ocr_off"))
+
+    def test_an_empty_file_is_skipped(self):
+        self.assertEqual(self.classify("a.pdf", 0), ("skip", "empty_file"))
+
+    def test_text_is_squeezed_and_capped(self):
+        self.assertEqual(mail_attachments.tidy_text("a \n\n b\t c", 100), "a b c")
+        self.assertEqual(mail_attachments.tidy_text("abcdef", 3), "abc")
+
+    def test_default_database_sits_beside_the_index(self):
+        with mock.patch.dict(os.environ, {"MAIL_MCP_INDEX_PATH": "/x/y/index.sqlite"}):
+            os.environ.pop("MAIL_MCP_ATTACHMENTS_PATH", None)
+            self.assertEqual(mail_attachments.database_path(), "/x/y/attachments.sqlite")
+        with mock.patch.dict(os.environ, {"MAIL_MCP_ATTACHMENTS_PATH": "/z/a.sqlite"}):
+            self.assertEqual(mail_attachments.database_path(), "/z/a.sqlite")
+
+    def test_a_query_limited_to_a_message_field_skips_attachments(self):
+        self.assertIsNone(mail_attachments.fts_query("subject: budget"))
+        self.assertIsNone(mail_attachments.fts_query("sender: jane"))
+        self.assertIsNotNone(mail_attachments.fts_query("budget"))
+        self.assertIsNotNone(mail_attachments.fts_query('"12:30" budget'))
+
+
+class AttachmentSyncTests(unittest.TestCase):
+    """Discovery, resumable processing and cleanup, on a fictional store."""
+
+    class Lock:
+        def touch(self):
+            pass
+
+    def setUp(self):
+        import base64
+        import zipfile
+
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.store = os.path.join(self.directory.name, "V1")
+        self.database = os.path.join(self.directory.name, "attachments.sqlite")
+        root = os.path.join(self.store, "Acct.mbox", "UUID")
+        # Message 12345: partial, its attachments are files on disk.
+        folder = os.path.join(root, "Data", "5", "4", "3", "Messages")
+        os.makedirs(folder)
+        self.partial = os.path.join(folder, "12345.partial.emlx")
+        with open(self.partial, "wb") as handle:
+            handle.write(b"x")
+        attachments = os.path.join(root, "Data", "2", "1", "Attachments", "12345")
+        for part, name in (("1", "plan.docx"), ("2", "all.zip"), ("3", "logo.png")):
+            os.makedirs(os.path.join(attachments, part))
+        self.docx = os.path.join(attachments, "1", "plan.docx")
+        with zipfile.ZipFile(self.docx, "w") as archive:
+            archive.writestr("word/document.xml", (
+                '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+                "<w:body><w:p><w:r><w:t>Warranty certificate for Example Ltd</w:t></w:r></w:p></w:body></w:document>"))
+        with open(os.path.join(attachments, "2", "all.zip"), "wb") as handle:
+            handle.write(b"PK")
+        with open(os.path.join(attachments, "3", "logo.png"), "wb") as handle:
+            handle.write(b"x" * 100_000)
+        # Message 20000: a full .emlx carrying a spreadsheet inside its MIME.
+        sheet = os.path.join(self.directory.name, "sheet.xlsx")
+        with zipfile.ZipFile(sheet, "w") as archive:
+            archive.writestr("xl/sharedStrings.xml", (
+                '<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                "<si><t>Invoice schedule</t></si></sst>"))
+        with open(sheet, "rb") as handle:
+            encoded = base64.encodebytes(handle.read()).decode()
+        raw = (
+            "From: jane@example.com\r\nSubject: Sheet\r\nMIME-Version: 1.0\r\n"
+            'Content-Type: multipart/mixed; boundary="b"\r\n\r\n--b\r\n'
+            "Content-Type: text/plain\r\n\r\nSee attached.\r\n--b\r\n"
+            'Content-Type: application/octet-stream; name="schedule.xlsx"\r\n'
+            'Content-Disposition: attachment; filename="schedule.xlsx"\r\n'
+            "Content-Transfer-Encoding: base64\r\n\r\n"
+            + encoded + "--b--\r\n"
+        ).encode()
+        folder = os.path.join(root, "Data", "0", "0", "2", "Messages")
+        os.makedirs(folder)
+        self.full = os.path.join(folder, "20000.emlx")
+        with open(self.full, "wb") as handle:
+            handle.write(str(len(raw)).encode() + b"\n" + raw + b"<plist></plist>")
+        self.files = {12345: self.partial, 20000: self.full}
+        self.connection = mail_attachments.open_database(self.database)
+        self.addCleanup(self.connection.close)
+
+    def discover(self, **kwargs):
+        return mail_attachments.discover(self.connection, self.store, self.files, kwargs.get("retry", False), log=lambda _: None)
+
+    def process(self):
+        return mail_attachments.process_pending(self.connection, self.files, self.Lock(), None, log=lambda _: None)
+
+    def rows(self):
+        return {row["filename"]: row for row in self.connection.execute("SELECT * FROM attachments")}
+
+    def test_discovery_records_what_to_read_and_what_to_skip_with_reasons(self):
+        self.discover()
+        rows = self.rows()
+        self.assertEqual(rows["plan.docx"]["status"], "pending")
+        self.assertEqual(rows["schedule.xlsx"]["status"], "pending")
+        self.assertEqual(rows["schedule.xlsx"]["part"], "mime:0")
+        self.assertEqual((rows["all.zip"]["status"], rows["all.zip"]["reason"]), ("skipped", "type"))
+        self.assertEqual((rows["logo.png"]["status"], rows["logo.png"]["reason"]), ("skipped", "decoration"))
+
+    def test_processing_stores_text_and_makes_it_searchable(self):
+        self.discover()
+        self.assertEqual(self.process(), 2)
+        rows = self.rows()
+        self.assertEqual(rows["plan.docx"]["status"], "ok")
+        self.assertIn("Warranty certificate", rows["plan.docx"]["text"])
+        self.assertIn("Invoice schedule", rows["schedule.xlsx"]["text"])
+        hits = mail_attachments.search_hits("warranty", path=self.database)
+        self.assertEqual([(hit.message, hit.filename) for hit in hits], [(12345, "plan.docx")])
+        self.assertEqual([hit.message for hit in mail_attachments.search_hits("schedule", path=self.database)], [20000])
+
+    def test_a_second_run_finds_nothing_to_do(self):
+        self.discover()
+        self.process()
+        self.connection.commit()
+        changed, removed = self.discover()
+        self.assertEqual((changed, removed), (0, 0))
+        self.assertEqual(self.process(), 0)
+
+    def test_an_interrupted_run_resumes_where_it_stopped(self):
+        self.discover()
+        with mock.patch.object(mail_attachments, "BATCH_ROWS", 1):
+            first = mail_attachments.process_pending(self.connection, self.files, self.Lock(), 1, log=lambda _: None)
+        self.assertEqual(first, 1)
+        pending = self.connection.execute("SELECT count(*) FROM attachments WHERE status = 'pending'").fetchone()[0]
+        self.assertEqual(pending, 1)
+        self.discover()
+        self.assertEqual(self.process(), 1)
+
+    def test_a_changed_file_is_read_again(self):
+        import zipfile
+
+        self.discover()
+        self.process()
+        with zipfile.ZipFile(self.docx, "w") as archive:
+            archive.writestr("word/document.xml", (
+                '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+                "<w:body><w:p><w:r><w:t>Revised terms</w:t></w:r></w:p></w:body></w:document>"))
+        os.utime(self.docx, (1, 1))
+        changed, _ = self.discover()
+        self.assertEqual(changed, 1)
+        self.process()
+        self.assertEqual(mail_attachments.search_hits("warranty", path=self.database), [])
+        self.assertEqual(len(mail_attachments.search_hits("revised", path=self.database)), 1)
+
+    def test_rows_of_a_message_that_left_the_store_are_deleted(self):
+        self.discover()
+        self.process()
+        del self.files[12345]
+        _, removed = self.discover()
+        self.assertEqual(removed, 3)
+        self.assertEqual(mail_attachments.search_hits("warranty", path=self.database), [])
+        self.assertEqual(self.connection.execute("SELECT count(*) FROM attachments").fetchone()[0], 1)
+
+    def test_a_file_that_disappeared_loses_its_row_but_not_its_siblings(self):
+        self.discover()
+        os.unlink(os.path.join(os.path.dirname(os.path.dirname(self.docx)), "2", "all.zip"))
+        _, removed = self.discover()
+        self.assertEqual(removed, 1)
+        self.assertNotIn("all.zip", self.rows())
+
+    def test_a_setting_change_reclassifies_skipped_images(self):
+        self.discover()
+        self.assertEqual(self.rows()["logo.png"]["reason"], "decoration")
+        with mock.patch.dict(os.environ, {"MAIL_MCP_ATTACHMENTS_OCR_IMAGES": "0"}):
+            self.discover()
+        self.assertEqual(self.rows()["logo.png"]["reason"], "ocr_off")
+
+    def test_mime_parts_are_written_to_a_private_directory_that_is_removed(self):
+        created = []
+        real = tempfile.mkdtemp
+
+        def spy(*args, **kwargs):
+            path = real(*args, **kwargs)
+            created.append(path)
+            return path
+
+        self.discover()
+        with mock.patch.object(mail_attachments.tempfile, "mkdtemp", spy):
+            self.process()
+        self.assertTrue(created)
+        for path in created:
+            self.assertFalse(os.path.exists(path))
+            self.assertFalse(path.startswith(config.PROJECT_ROOT))
+
+    def test_status_counts_rows_by_status(self):
+        self.discover()
+        self.process()
+        report = mail_attachments.status(self.database)
+        self.assertTrue(report["built"])
+        self.assertEqual(report["files_by_status"], {"ok": 2, "skipped": 2})
+        self.assertEqual(report["pending"], 0)
+        self.assertFalse(mail_attachments.status(os.path.join(self.directory.name, "none.sqlite"))["built"])
+
+
+class AttachmentSearchTests(_FictionalIndexMixin, unittest.TestCase):
+    """search_all merging the text of attachments, from a separate database."""
+
+    def setUp(self):
+        super().setUp()
+        self.attachments_path = os.path.join(self.directory.name, "attachments.sqlite")
+        connection = mail_attachments.open_database(self.attachments_path)
+        self.next_id = 1
+        self.connection = connection
+        self.addCleanup(connection.close)
+        patcher = mock.patch.object(mail_attachments, "database_path", lambda: self.attachments_path)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def add(self, message, filename, text):
+        identifier = self.next_id
+        self.next_id += 1
+        self.connection.execute(
+            "INSERT INTO attachments (id, message, part, filename, ext, size, mtime, status, text)"
+            " VALUES (?,?,?,?,?,?,0,'ok',?)",
+            (identifier, message, f"1/{filename}", filename, os.path.splitext(filename)[1], 1, text),
+        )
+        mail_attachments.store_fts(self.connection, identifier, filename, text)
+        self.connection.commit()
+
+    def test_a_message_matched_only_through_an_attachment_is_found_and_says_so(self):
+        self.add(2, "certificate.pdf", "This warranty certificate covers the boiler.")
+        result = mail_search.search_all("warranty", max_age_minutes=10**9)
+        self.assertEqual([m["mail_id"] for m in result["messages"]], [2])
+        match = result["messages"][0]
+        self.assertEqual(match["attachment_match"]["filename"], "certificate.pdf")
+        self.assertTrue(match["snippet"].startswith("[attachment: certificate.pdf]"))
+        self.assertIn("warranty", match["snippet"])
+
+    def test_without_an_attachment_index_search_is_unchanged(self):
+        os.unlink(self.attachments_path)
+        self.assertEqual(self.ids("roadmap"), [2, 3, 1])
+        self.assertNotIn("attachments_note", mail_search.search_all("roadmap", max_age_minutes=10**9))
+
+    def test_an_unreadable_attachment_index_does_not_break_search(self):
+        with open(self.attachments_path, "wb") as handle:
+            handle.write(b"this is not a database" * 100)
+        result = mail_search.search_all("roadmap", max_age_minutes=10**9)
+        self.assertEqual([m["mail_id"] for m in result["messages"]], [2, 3, 1])
+
+    def test_operators_still_filter_attachment_hits(self):
+        self.add(2, "certificate.pdf", "warranty certificate")
+        self.assertEqual(self.ids("warranty from:jane@example.com"), [])
+        self.assertEqual(self.ids("warranty from:john@example.org"), [2])
+        self.assertEqual(self.ids("warranty", since="2999-01-01"), [])
+
+    def test_an_attachment_hit_lifts_a_message_that_also_matches_on_its_own(self):
+        self.assertEqual(self.ids("budget"), [5, 4, 6])
+        for number in range(3):
+            self.add(4, f"budget{number}.xlsx", "budget budget budget budget quarterly budget")
+        self.assertEqual(self.ids("budget")[0], 4)
+
+    def test_a_narrow_filter_is_applied_before_the_attachment_cap(self):
+        # Message 1 has the far better attachment hit, message 2 the only one
+        # that passes the filter: a cap of one applied first would lose it.
+        self.add(1, "strong.pdf", "warranty warranty warranty warranty warranty")
+        self.add(2, "weak.pdf", "one warranty among many other words in this long certificate text")
+        with mock.patch.object(mail_search, "ATTACHMENT_CANDIDATES", 1):
+            self.assertEqual(self.ids("warranty from:john@example.org"), [2])
+
+    def test_a_filter_matching_too_many_messages_widens_the_cap_instead(self):
+        self.add(1, "strong.pdf", "warranty warranty warranty warranty warranty")
+        self.add(2, "weak.pdf", "one warranty among many other words in this long certificate text")
+        with mock.patch.object(mail_search, "ATTACHMENT_CANDIDATES", 1), \
+                mock.patch.object(mail_search, "ATTACHMENT_ID_LIMIT", 0):
+            self.assertEqual(self.ids("warranty from:john@example.org"), [2])
+
+    def test_a_query_limited_to_a_message_field_ignores_attachments(self):
+        self.add(2, "certificate.pdf", "warranty certificate")
+        self.assertEqual(self.ids("subject: warranty"), [])
+
+    def test_date_sort_places_an_attachment_only_hit_by_date(self):
+        self.add(4, "budget.xlsx", "budget")
+        self.assertEqual(self.ids("budget", sort="date"), [5, 4, 6])
+        self.add(1, "notes.pdf", "budget forecast")
+        self.assertEqual(self.ids("budget", sort="date"), [1, 5, 4, 6])
+
+    def test_snippets_can_be_turned_off(self):
+        self.add(2, "certificate.pdf", "warranty certificate")
+        result = mail_search.search_all("warranty", max_age_minutes=10**9, snippets=False)
+        self.assertNotIn("snippet", result["messages"][0])
+        self.assertNotIn("snippet", result["messages"][0]["attachment_match"])
+
+    def test_the_status_reports_the_attachment_index(self):
+        self.add(2, "certificate.pdf", "warranty certificate")
+        report = mail_search.index_status()
+        self.assertTrue(report["attachments"]["built"])
+        self.assertEqual(report["attachments"]["files_by_status"], {"ok": 1})
+
+
+class AttachmentEvalPairTests(unittest.TestCase):
+    TEXT = ("The heating installation certificate lists radiators, thermostats, boilers and "
+            "manifolds delivered to the Example Ltd warehouse with serial numbers attached. ") * 3
+
+    def test_pairs_expect_the_message_and_avoid_its_subject_words(self):
+        pairs = mail_eval.generate_attachment_pairs(
+            [(7, "Installation certificate", self.TEXT)], 5, random.Random(1))
+        self.assertEqual(len(pairs), 1)
+        self.assertEqual((pairs[0]["expected"], pairs[0]["kind"]), (7, "attachment"))
+        self.assertFalse({"installation", "certificate"} & set(pairs[0]["query"].split()))
+
+    def test_a_query_the_message_already_answers_is_dropped(self):
+        pairs = mail_eval.generate_attachment_pairs(
+            [(7, "Notes", self.TEXT)], 5, random.Random(1), found_by_message=lambda query, identifier: True)
+        self.assertEqual(pairs, [])
+
+    def test_rare_words_only(self):
+        pairs = mail_eval.generate_attachment_pairs(
+            [(7, "Notes", self.TEXT)], 5, random.Random(1), is_rare=lambda word: word == "manifolds")
+        self.assertEqual(pairs, [])  # a single acceptable word makes no query
+
+    def test_redrawing_attachment_pairs_keeps_the_other_kinds(self):
+        existing = [
+            {"query": "a b", "expected": 1, "source": "auto", "kind": "subject"},
+            {"query": "c d", "expected": 2, "source": "auto", "kind": "attachment"},
+            {"query": "e f", "expected": 3, "source": "manual"},
+        ]
+        fresh = [{"query": "g h", "expected": 4, "source": "auto", "kind": "attachment"}]
+        merged = mail_eval.merge_pairs(existing, fresh, ("attachment",))
+        self.assertEqual([pair["query"] for pair in merged], ["a b", "e f", "g h"])
+        self.assertEqual([pair["query"] for pair in mail_eval.merge_pairs(existing, fresh)], ["e f", "g h"])
+
+    def test_the_kind_is_reported_apart(self):
+        rows = [{"rank": 1, "kind": "attachment"}, {"rank": None, "kind": "subject"}]
+        by_kind = mail_eval.aggregate_by_kind(rows)
+        self.assertEqual(by_kind["attachment"]["recall_at_1"], 1.0)
+        self.assertEqual(by_kind["subject"]["not_found"], 1)
+
+
+class AttachmentRobustnessTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+
+    def test_a_killed_compile_leaves_no_binary_behind(self):
+        build = os.path.join(self.directory.name, "build")
+        with mock.patch.object(mail_attachments, "SWIFTC", "/usr/bin/true"), \
+                mock.patch.object(mail_attachments.subprocess, "run",
+                                  side_effect=KeyboardInterrupt) as run:
+            with self.assertRaises(KeyboardInterrupt):
+                mail_attachments.compile_tool("pdftext", build)
+        self.assertEqual(os.listdir(build), [])
+        self.assertTrue(run.called)
+
+    def test_a_tool_that_does_not_run_is_not_installed(self):
+        build = os.path.join(self.directory.name, "build")
+
+        def fake(command, **kwargs):
+            if command[0] == mail_attachments.SWIFTC:
+                with open(command[command.index("-o") + 1], "w") as handle:
+                    handle.write("broken")
+                return subprocess.CompletedProcess(command, 0, "", "")
+            return subprocess.CompletedProcess(command, 1, b"", b"")
+
+        with mock.patch.object(mail_attachments, "SWIFTC", "/usr/bin/true"), \
+                mock.patch.object(mail_attachments.subprocess, "run", side_effect=fake):
+            with self.assertRaises(MailError) as caught:
+                mail_attachments.compile_tool("pdftext", build)
+        self.assertEqual(caught.exception.code, "swiftc_failed")
+        self.assertEqual(os.listdir(build), [])
+
+    def test_old_work_directories_are_swept_and_recent_ones_kept(self):
+        with mock.patch.object(mail_attachments.tempfile, "gettempdir", lambda: self.directory.name):
+            old = os.path.join(self.directory.name, "mail-attachments-old")
+            recent = os.path.join(self.directory.name, "mail-attachments-recent")
+            other = os.path.join(self.directory.name, "unrelated-old")
+            for path in (old, recent, other):
+                os.mkdir(path)
+                open(os.path.join(path, "payload.pdf"), "w").close()
+            past = time.time() - 3600
+            for path in (old, other):
+                os.utime(path, (past, past))
+            self.assertEqual(mail_attachments.sweep_workspaces(), 1)
+        self.assertFalse(os.path.exists(old))
+        self.assertTrue(os.path.exists(recent))
+        self.assertTrue(os.path.exists(other))
+
+    def test_a_sync_sweeps_before_it_starts(self):
+        with mock.patch.object(mail_attachments, "sweep_workspaces", return_value=2) as sweep, \
+                mock.patch.object(mail_attachments.mail_index, "scan_message_files", return_value={}):
+            database = os.path.join(self.directory.name, "attachments.sqlite")
+            mail_attachments.sync(self.directory.name, database, log=lambda message: None)
+        sweep.assert_called_once()
+
+    def test_the_background_sync_child_is_reaped(self):
+        path = os.path.join(self.directory.name, "attachments.sqlite")
+        open(path, "w").close()
+        child = mock.Mock()
+        waited = threading.Event()
+        child.wait.side_effect = lambda: waited.set()
+        with mock.patch.object(mail_attachments, "database_path", lambda: path), \
+                mock.patch.object(mail_attachments.subprocess, "Popen", return_value=child):
+            self.assertTrue(mail_attachments.start_background_sync())
+        self.assertTrue(waited.wait(5))
+
+    def test_a_doc_too_large_or_too_verbose_is_bounded(self):
+        path = os.path.join(self.directory.name, "big.doc")
+        with open(path, "wb") as handle:
+            handle.write(b"x" * 100)
+        with mock.patch.object(mail_attachments, "DOC_MAX_BYTES", 10):
+            with self.assertRaises(RuntimeError):
+                mail_attachments.extract_doc(path)
+        # A converter that never stops writing is cut at the cap.
+        fake = subprocess.Popen(["/usr/bin/yes", "word"], stdout=subprocess.PIPE)
+        self.addCleanup(fake.kill)
+        with mock.patch.object(mail_attachments.subprocess, "Popen", return_value=fake):
+            text = mail_attachments.extract_doc(path, limit=1000)
+        self.assertEqual(len(text), 1000)
+        fake.wait()
+
+
+class AttachmentToolRunnerTests(unittest.TestCase):
+    """run_batch against a stand-in tool, so no Swift and no real file is needed."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.tool = os.path.join(self.directory.name, "tool.sh")
+        with open(self.tool, "w") as handle:
+            handle.write(
+                "#!/bin/sh\n"
+                'for f in "$@"; do\n'
+                '  case "$f" in --*) continue;; esac\n'
+                '  case "$f" in *hang*) exec sleep 30;; *crash*) exit 3;; esac\n'
+                '  printf \'{"path": "%s", "pages": 1, "text": "ok", "error": null}\\n\' "$f"\n'
+                "done\n"
+            )
+        os.chmod(self.tool, 0o755)
+
+    def test_every_file_gets_a_result_even_when_the_tool_hangs_or_dies(self):
+        with mock.patch.object(mail_attachments, "TOOL_START_TIMEOUT", 1), \
+                mock.patch.object(mail_attachments, "TOOL_STALL_TIMEOUT", 1):
+            results = mail_attachments.run_batch(self.tool, ["a", "hang", "b", "crash", "c"])
+        self.assertEqual([results[name]["error"] for name in ("a", "hang", "b", "crash", "c")],
+                         [None, "tool_failed", None, "tool_failed", None])
+
+    def test_a_missing_swift_compiler_is_explained(self):
+        with mock.patch.object(mail_attachments, "SWIFTC", "/nonexistent/swiftc"), \
+                mock.patch.object(mail_attachments, "BUILD_DIR", self.directory.name):
+            with self.assertRaises(MailError) as caught:
+                mail_attachments.compile_tool("pdftext", self.directory.name)
+        self.assertEqual(caught.exception.code, "swiftc_missing")
+        self.assertIn("xcode-select", caught.exception.hint)
+
+
+class OfficeExtractionTests(unittest.TestCase):
+    """docx / xlsx / pptx text extraction, on files generated here."""
+
+    W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    S = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    A = "http://schemas.openxmlformats.org/drawingml/2006/main"
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+
+    def make(self, name: str, members: dict[str, str]) -> str:
+        import zipfile
+
+        path = os.path.join(self.directory.name, name)
+        with zipfile.ZipFile(path, "w") as archive:
+            for member, xml in members.items():
+                archive.writestr(member, xml)
+        return path
+
+    def test_docx_paragraphs_become_lines(self):
+        path = self.make("a.docx", {"word/document.xml": (
+            f'<w:document xmlns:w="{self.W}"><w:body>'
+            "<w:p><w:r><w:t>Quote for Example Ltd</w:t></w:r></w:p>"
+            "<w:p><w:r><w:t>Total </w:t></w:r><w:r><w:t>1200</w:t></w:r></w:p>"
+            "</w:body></w:document>")})
+        self.assertEqual(mail_attachments.extract_docx(path).split(), ["Quote", "for", "Example", "Ltd", "Total", "1200"])
+        self.assertIn("\nTotal 1200", mail_attachments.extract_docx(path))
+
+    def test_xlsx_reads_shared_and_inline_strings_but_not_numbers(self):
+        path = self.make("a.xlsx", {
+            "xl/sharedStrings.xml": f'<sst xmlns="{self.S}"><si><t>Invoice</t></si><si><r><t>Jane </t></r><r><t>Doe</t></r></si></sst>',
+            "xl/worksheets/sheet1.xml": (
+                f'<worksheet xmlns="{self.S}"><sheetData><row>'
+                '<c t="s"><v>0</v></c><c><v>42</v></c>'
+                '<c t="inlineStr"><is><t>Inline note</t></is></c>'
+                "</row></sheetData></worksheet>"),
+        })
+        text = mail_attachments.extract_xlsx(path)
+        self.assertIn("Invoice", text)
+        self.assertIn("Jane Doe", text)
+        self.assertIn("Inline note", text)
+        self.assertNotIn("42", text)
+
+    def test_pptx_slides_are_read_in_numeric_order(self):
+        slide = lambda word: f'<p:sld xmlns:p="x" xmlns:a="{self.A}"><a:p><a:r><a:t>{word}</a:t></a:r></a:p></p:sld>'
+        path = self.make("a.pptx", {
+            "ppt/slides/slide10.xml": slide("tenth"),
+            "ppt/slides/slide2.xml": slide("second"),
+        })
+        self.assertEqual(mail_attachments.extract_pptx(path).split(), ["second", "tenth"])
+
+    def test_the_character_cap_is_applied(self):
+        body = "".join(f"<w:p><w:r><w:t>{'word ' * 50}</w:t></w:r></w:p>" for _ in range(100))
+        path = self.make("big.docx", {"word/document.xml": f'<w:document xmlns:w="{self.W}"><w:body>{body}</w:body></w:document>'})
+        self.assertEqual(len(mail_attachments.extract_docx(path, limit=500)), 500)
+
+    def test_a_corrupt_file_raises_instead_of_returning_garbage(self):
+        path = os.path.join(self.directory.name, "bad.docx")
+        with open(path, "wb") as handle:
+            handle.write(b"not a zip")
+        with self.assertRaises(Exception):
+            mail_attachments.extract_docx(path)
 
 
 if __name__ == "__main__":

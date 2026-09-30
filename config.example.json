@@ -14,5 +14,11 @@
 
   "applescript_timeout": 120,
   "applescript_write_timeout": 180,
-  "body_limit": 200000
+  "body_limit": 200000,
+
+  "attachments_path": "",
+  "attachments_ocr_images": true,
+  "attachments_max_mb": 20,
+  "attachments_char_limit": 100000,
+  "attachments_auto_sync": true
 }

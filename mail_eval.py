@@ -82,7 +82,8 @@ WORD_PATTERN = re.compile(r"[^\W_]+", re.UNICODE)
 
 KIND_SUBJECT = "subject"
 KIND_BODY = "body"
-KINDS = (KIND_SUBJECT, KIND_BODY)
+KIND_ATTACHMENT = "attachment"
+KINDS = (KIND_SUBJECT, KIND_BODY, KIND_ATTACHMENT)
 
 # A body text shorter than this (characters of own text) says too little.
 MIN_BODY_CHARS = 120
@@ -214,6 +215,39 @@ def generate_body_pairs(
     return pairs
 
 
+def generate_attachment_pairs(
+    candidates: list[tuple[int, str, str]],
+    count: int,
+    rng: random.Random,
+    is_rare: Any = None,
+    found_by_message: Any = None,
+    taken: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Draws up to `count` pairs from (message id, subject, attachment text).
+
+    The query is a few distinctive words of the attachment; the expected result
+    is its message. `is_rare` keeps words that match few attachments.
+    `found_by_message(query, id)` says whether the message's own fields already
+    hold the query: such a pair proves nothing about attachment search, so it is
+    dropped. `taken` holds queries already used.
+    """
+    pool = list(candidates)
+    rng.shuffle(pool)
+    queries = set(taken or ())
+    pairs: list[dict[str, Any]] = []
+    for identifier, subject, text in pool:
+        if len(pairs) >= count:
+            break
+        query = derive_body_query(text, subject, rng, is_rare)
+        if query is None or query in queries:
+            continue
+        if found_by_message is not None and found_by_message(query, identifier):
+            continue
+        queries.add(query)
+        pairs.append({"query": query, "expected": identifier, "source": "auto", "kind": KIND_ATTACHMENT})
+    return pairs
+
+
 def generate_pairs(
     candidates: list[tuple[int, str]], count: int, rng: random.Random
 ) -> list[dict[str, Any]]:
@@ -238,10 +272,24 @@ def generate_pairs(
     return pairs
 
 
-def merge_pairs(existing: list[dict[str, Any]], generated: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Manual pairs survive; the previous auto pairs are replaced."""
-    manual = [pair for pair in existing if pair.get("source") == "manual"]
-    return manual + generated
+def merge_pairs(
+    existing: list[dict[str, Any]],
+    generated: list[dict[str, Any]],
+    replace_kinds: tuple[str, ...] | None = None,
+) -> list[dict[str, Any]]:
+    """Manual pairs survive; the previous auto pairs are replaced.
+
+    With `replace_kinds`, only the auto pairs of those kinds are replaced and
+    the others are kept: drawing attachment pairs must not redraw the rest.
+    """
+    if replace_kinds is None:
+        kept = [pair for pair in existing if pair.get("source") == "manual"]
+    else:
+        kept = [
+            pair for pair in existing
+            if pair.get("source") == "manual" or pair_kind(pair) not in replace_kinds
+        ]
+    return kept + generated
 
 
 # --------------------------------------------------------------------------
@@ -458,6 +506,61 @@ def body_sources(path: str) -> tuple[Any, Any, Any]:
     return load_text, is_rare, connection.close
 
 
+def attachment_sources(index_path: str) -> tuple[list[tuple[int, str, str]], Any, Any, Any]:
+    """(candidates, is_rare, found_by_message, close) for attachment pairs.
+
+    Candidates are messages of the index with a readable attachment of some
+    length, one attachment each (the longest, most likely a real document).
+    """
+    import mail_attachments  # deferred: only attachment generation needs it
+
+    path = mail_attachments.database_path()
+    if not os.path.isfile(path):
+        raise EvalError(f"No attachment index at {path}. Build it first: python3 mail_attachments.py --sync")
+    attachments = open_readonly(path)
+    index = open_readonly(index_path)
+    subjects = dict(index.execute("SELECT id, COALESCE(subject, '') FROM messages"))
+    rows = attachments.execute(
+        "SELECT message, text FROM attachments WHERE status = 'ok' AND chars >= ? ORDER BY chars DESC",
+        (MIN_BODY_CHARS * 2,),
+    ).fetchall()
+    best: dict[int, str] = {}
+    for message, text in rows:
+        if message in subjects and message not in best:
+            best[message] = text
+    candidates = [(message, subjects[message], text) for message, text in best.items()]
+    cache: dict[str, bool] = {}
+
+    def is_rare(word: str) -> bool:
+        if word not in cache:
+            match = mail_attachments.fts_query(f'"{word}"')
+            try:
+                hits = attachments.execute(
+                    "SELECT count(*) FROM (SELECT rowid FROM attachments_fts WHERE attachments_fts MATCH ? LIMIT ?)",
+                    (match, MAX_DOCUMENT_FREQUENCY + 1),
+                ).fetchone()[0]
+            except sqlite3.Error:
+                hits = 0
+            cache[word] = 0 < hits <= MAX_DOCUMENT_FREQUENCY
+        return cache[word]
+
+    def found_by_message(query: str, identifier: int) -> bool:
+        try:
+            row = index.execute(
+                "SELECT 1 FROM messages_fts WHERE messages_fts MATCH ? AND rowid = ?",
+                (mail_stem.rewrite_query(query), identifier),
+            ).fetchone()
+        except sqlite3.Error:
+            return False
+        return row is not None
+
+    def close() -> None:
+        attachments.close()
+        index.close()
+
+    return candidates, is_rare, found_by_message, close
+
+
 # Endings swapped by inflect_word, longest first. Each maps a word to another
 # inflected form (usually) of the same lexeme; the result need not be a
 # dictionary word, only a form a French speaker could have typed.
@@ -553,7 +656,7 @@ def format_by_kind(by_kind: dict[str, dict[str, Any]]) -> str:
     """One line per kind; nothing when only one kind ran (it would repeat "all")."""
     if len(by_kind) <= 2:
         return format_aggregate(by_kind["all"])
-    return "\n".join(f"{kind:<8} {format_aggregate(by_kind[kind])}" for kind in (*KINDS, "all") if kind in by_kind)
+    return "\n".join(f"{kind:<11} {format_aggregate(by_kind[kind])}" for kind in (*KINDS, "all") if kind in by_kind)
 
 
 def format_comparison(name: str, comparison: dict[str, Any]) -> str:
@@ -584,6 +687,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Evaluate search relevance against the local index.")
     parser.add_argument("--generate", type=int, metavar="N", help="build N automatic subject pairs from the index")
     parser.add_argument("--body", type=int, metavar="N", help="also build N automatic pairs from message bodies")
+    parser.add_argument("--attach", type=int, metavar="N",
+                        help="also build N pairs from attachment text (needs attachments.sqlite); alone, "
+                             "it keeps every other pair and only redraws the attachment ones")
     parser.add_argument("--seed", type=int, help="seed for --generate, to reproduce a draw")
     parser.add_argument("--pairs", default=DEFAULT_PAIRS, help=f"pairs file (default: {DEFAULT_PAIRS})")
     parser.add_argument("--run", action="store_true", help="run every pair and report ranks")
@@ -602,7 +708,8 @@ def main() -> int:
 
 def _main(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> int:
 
-    if arguments.body is not None and arguments.generate is None:
+    attach_only = arguments.attach is not None and arguments.generate is None and arguments.body is None
+    if (arguments.body is not None or arguments.attach is not None) and arguments.generate is None:
         arguments.generate = 0
     if arguments.generate is None and not arguments.run:
         parser.print_help()
@@ -616,7 +723,7 @@ def _main(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> int
 
     if arguments.generate is not None:
         index_path = config.get("index_path")
-        candidates = load_candidates(index_path)
+        candidates = load_candidates(index_path) if not attach_only else []
         generated = generate_pairs(candidates, arguments.generate, random.Random(arguments.seed))
         wanted = arguments.generate
         if arguments.body:
@@ -635,15 +742,26 @@ def _main(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> int
             finally:
                 close()
             wanted += arguments.body
+        if arguments.attach:
+            attach_rng = random.Random(None if arguments.seed is None else f"attach-{arguments.seed}")
+            pool, is_rare_attachment, in_message, close_attachments = attachment_sources(index_path)
+            try:
+                generated += generate_attachment_pairs(
+                    pool, arguments.attach, attach_rng, is_rare_attachment, in_message,
+                    {pair["query"] for pair in generated},
+                )
+            finally:
+                close_attachments()
+            wanted += arguments.attach
         if not generated:
             print(f"No usable subject found: {arguments.pairs} left untouched.", file=sys.stderr)
             if not arguments.run:
                 return 1
         else:
             existing, _ = load_pairs(arguments.pairs)
-            merged = merge_pairs(existing, generated)
+            merged = merge_pairs(existing, generated, (KIND_ATTACHMENT,) if attach_only else None)
             save_pairs(arguments.pairs, merged)
-            kept = len(merged) - len(generated)
+            kept = len(merged) - len(generated)  # manual pairs, and the other kinds when attach only
             counts = ", ".join(
                 f"{sum(1 for pair in generated if pair_kind(pair) == kind)} {kind}" for kind in KINDS
             )

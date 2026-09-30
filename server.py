@@ -116,7 +116,11 @@ def search_all(
     interface thread. The index is built by mail_index.py; if it is missing or
     stale, index_status says so and sync_index refreshes it.
 
-    Subject, sender, To and Cc recipients, body and attachment names are all searched.
+    Subject, sender, To and Cc recipients, body and attachment names are all searched;
+    so is the text inside attachments (PDF, Word, Excel, PowerPoint, scans and
+    images) once the attachment index is built (mail_attachments.py). A message
+    found through one carries "attachment_match" (file name, snippet) and a snippet
+    starting "[attachment: name]".
     Words can be restricted to one field with "subject: facture", "sender: jane"
     or "attachments: plan"; "recipients:" searches To and Cc together. Combine
     with AND / OR / NOT, and quote an exact phrase.
@@ -189,7 +193,11 @@ def get_thread(message_id: str, limit: int = 100) -> dict[str, Any]:
 
 @mcp.tool()
 def index_status() -> dict[str, Any]:
-    """Report what the search index holds and when it was last refreshed."""
+    """Report what the search index holds and when it was last refreshed.
+
+    Also reports "attachments": whether the attachment text index is built, its
+    files by status (ok, pending, skipped, error...), size and last run.
+    """
     return _guard(mail_search.index_status)
 
 
@@ -197,7 +205,9 @@ def index_status() -> dict[str, Any]:
 def sync_index() -> dict[str, Any]:
     """Refresh the search index: new messages in, deleted ones out.
 
-    Needs Full Disk Access for the process running this server.
+    Needs Full Disk Access for the process running this server. When the
+    attachment text index exists, its own sync is started in the background
+    ("attachments_sync" in the answer): it takes minutes and is never waited for.
     """
     return _guard(mail_search.sync_index)
 

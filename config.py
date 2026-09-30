@@ -52,6 +52,21 @@ DEFAULTS: dict[str, Any] = {
     "applescript_write_timeout": 180,
     # Characters of body text kept per message when indexing.
     "body_limit": 200_000,
+    # The attachment text index (mail_attachments.py). Empty means
+    # attachments.sqlite beside the search index, so a scratch index_path
+    # keeps its attachments out of the real one.
+    "attachments_path": "",
+    # OCR of images (png, jpg, heic) of at least 50 KB whose name is not a logo.
+    # Scanned PDFs are always read with OCR; this only concerns loose images.
+    "attachments_ocr_images": True,
+    # Largest file read: PDFs up to this many MB, other types up to half of it.
+    "attachments_max_mb": 20,
+    # Characters kept per attachment.
+    "attachments_char_limit": 100_000,
+    # After a message sync run from search_all / sync_index, start
+    # mail_attachments.py --sync in the background (only once the attachment
+    # index exists).
+    "attachments_auto_sync": True,
 }
 
 _FILE_VALUES: dict[str, Any] | None = None
