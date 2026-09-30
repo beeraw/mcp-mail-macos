@@ -247,6 +247,7 @@ claude mcp add mail-macos -s user -e MAIL_MCP_DRAFTS_FOLDER="$HOME/Documents/Out
 | `attachments_max_mb` | `20` | Largest attachment read: PDFs up to this, other types up to half |
 | `attachments_char_limit` | `100000` | Characters kept per attachment |
 | `attachments_auto_sync` | `true` | After a message sync, start the attachment sync in the background (once that index exists) |
+| `saved_searches_path` | beside `index_path` | The named searches of `saved_search`, `saved_searches.json` (gitignored) |
 
 The `launchd` agent is the one place a path cannot come from configuration:
 launchd needs absolute paths in the plist itself. Replace `/ABSOLUTE/PATH/TO`
@@ -262,6 +263,7 @@ in `launchd/com.mcp-mail-macos.sync.plist` before installing it.
 | --- | --- |
 | `search_all(query, account, mailbox, unread_only, flagged_only, since, until, limit, sort, snippets)` | Search every account, through the local index |
 | `aggregate(group_by, query, account, mailbox, unread_only, flagged_only, since, until, limit, order)` | Count matching messages per sender, domain, month, year, account, mailbox or recipient ("who writes to me most", volumes per month) |
+| `saved_search(action, name, description, query, account, mailbox, unread_only, flagged_only, since, until, limit, sort, snippets)` | Save a frequent search under a name (`save`), re-run it (`run`, with optional overrides), or `list` / `show` / `delete` saved ones |
 | `get_thread(message_id, limit)` | The whole conversation a message belongs to |
 | `index_status()` | What the index holds, how old it is, how many messages have a searchable body (per account and overall), and the state of the attachment index |
 | `sync_index()` | Bring the index up to date |
@@ -272,6 +274,17 @@ works — `subject: invoice`, `sender: jane` (`recipients:` searches
 To and Cc together), `AND` / `OR` / `NOT`, `"exact phrase"`, `NEAR(one two, 5)`.
 A query that is not valid FTS5 (`invoice 12/2025`) is reinterpreted word by
 word, which the answer reports in `interpreted_as`.
+
+`saved_search` keeps a frequent search under a name. `save` stores the
+`search_all` parameters you pass (the query, with any Gmail operators, is
+required) plus an optional description; `run` executes it and returns exactly
+what `search_all` returns, and any parameter passed to `run` overrides the
+stored one for that run (`saved_search("run", "unread from Jane", limit=5)`).
+Saving under an existing name (any case) replaces that search. Store relative
+operators such as `newer_than:7d` rather than fixed dates: the query is kept as
+text and evaluated again at each run. One tool with an action, rather than one
+tool per action, keeps the tool list short. The file is written atomically and
+holds queries only; `aggregate` does not take a saved search.
 
 `aggregate` takes the same query, operators and filters but returns counts
 instead of messages: `aggregate("sender", "to:me -is:bulk", since="2026-01-01")`
@@ -932,6 +945,7 @@ mcp-mail-macos/
 ├── mail_imap.py        # the account's own server, for filing and sending
 ├── mail_files.py       # .eml drafts, retention, leftover sweep
 ├── mail_search.py      # querying the index
+├── mail_saved.py       # named searches (saved_search tool)
 ├── mail_index.py       # building and updating the index
 ├── mail_stem.py        # French light stemmer and query rewrite
 ├── mail_attachments.py # attachment text: extractors, attachments.sqlite, sync

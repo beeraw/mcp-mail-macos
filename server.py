@@ -17,6 +17,7 @@ except ImportError:  # pragma: no cover - SDK 1.x
     from mcp.server.fastmcp import FastMCP as _Server
 
 import mail_files
+import mail_saved
 import mail_search
 import mail_tools
 from mail_tools import MailError
@@ -224,6 +225,81 @@ def aggregate(
         limit=limit,
         order=order,
     )
+
+
+@mcp.tool()
+def saved_search(
+    action: str,
+    name: str | None = None,
+    description: str | None = None,
+    query: str | None = None,
+    account: str | None = None,
+    mailbox: str | None = None,
+    unread_only: bool | None = None,
+    flagged_only: bool | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    limit: int | None = None,
+    sort: str | None = None,
+    snippets: bool | None = None,
+) -> dict[str, Any]:
+    """Save a frequent search under a name, and run it again by name.
+
+    One tool, five actions:
+    - "save": name + the search_all parameters to keep (query is required;
+      description is optional). An existing name (any case) is replaced whole,
+      not merged. Only the parameters you pass are stored; the others keep
+      search_all's defaults.
+    - "run": name, optionally with parameters that override the stored ones for
+      this run only (e.g. limit=5, or a different account). Returns exactly what
+      search_all returns.
+    - "list": every saved search with its parameters, by name.
+    - "show": one saved search.
+    - "delete": remove one.
+
+    Relative dates: write "newer_than:7d" (or older_than:) in the query, not a
+    fixed date. The query is stored as text and evaluated at every run, so
+    "is:unread newer_than:7d" always means the last seven days. "after:" /
+    "before:", since and until are fixed dates and stay fixed.
+
+    Names: up to 64 characters, letters, digits, spaces, . - _ ' ; unique
+    regardless of case. The searches are kept in a local file outside the
+    repository (setting saved_searches_path).
+
+    Examples:
+        saved_search("save", "unread from Jane", query="is:unread from:jane@example.com newer_than:30d")
+        saved_search("run", "unread from Jane", limit=5)
+    """
+    if action not in mail_saved.ACTIONS:
+        return {
+            "ok": False,
+            "error_code": "invalid_action",
+            "error": f"Unknown action {action!r}.",
+            "hint": "Use one of: " + ", ".join(mail_saved.ACTIONS) + ".",
+        }
+    parameters = {
+        "query": query,
+        "account": account,
+        "mailbox": mailbox,
+        "unread_only": unread_only,
+        "flagged_only": flagged_only,
+        "since": since,
+        "until": until,
+        "limit": limit,
+        "sort": sort,
+        "snippets": snippets,
+    }
+    if action == "list":
+        return _guard(mail_saved.list_all)
+    if action in ("show", "delete", "run", "save") and name is None:
+        return {"ok": False, "error_code": "invalid_name", "error": f"{action} needs a name."}
+    if action == "show":
+        return _guard(mail_saved.show, name)
+    if action == "delete":
+        return _guard(mail_saved.delete, name)
+    if action == "run":
+        return _guard(mail_saved.run, name, **parameters)
+    return _guard(mail_saved.save, name, description, **parameters)
 
 
 @mcp.tool()

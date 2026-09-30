@@ -38,6 +38,7 @@ import mail_imap
 import mail_index
 import mail_message
 import mail_operators
+import mail_saved
 import mail_search
 import mail_stem
 import mail_signature
@@ -3451,6 +3452,128 @@ class OfficeExtractionTests(unittest.TestCase):
             handle.write(b"not a zip")
         with self.assertRaises(Exception):
             mail_attachments.extract_docx(path)
+
+
+class SavedSearchTests(unittest.TestCase):
+    def setUp(self):
+        import shutil
+
+        self.folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.folder, True)
+        self.path = os.path.join(self.folder, "nested", "saved.json")
+        patcher = mock.patch.object(mail_saved, "storage_path", return_value=self.path)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_missing_file_is_an_empty_list(self):
+        self.assertEqual(mail_saved.list_all(), {"ok": True, "count": 0, "saved_searches": []})
+
+    def test_save_list_show_delete(self):
+        first = mail_saved.save("Unread from Jane", "Weekly check", query="is:unread from:jane@example.com", limit=5)
+        self.assertFalse(first["replaced"])
+        mail_saved.save("Budget", query="budget", account="Work", sort="date")
+        listed = mail_saved.list_all()
+        self.assertEqual([item["name"] for item in listed["saved_searches"]], ["Budget", "Unread from Jane"])
+        shown = mail_saved.show("unread from jane")["saved_search"]
+        self.assertEqual(shown["params"], {"query": "is:unread from:jane@example.com", "limit": 5})
+        self.assertEqual(shown["description"], "Weekly check")
+        self.assertEqual(mail_saved.delete("BUDGET")["deleted"], "Budget")
+        self.assertEqual(mail_saved.list_all()["count"], 1)
+        with self.assertRaises(MailError) as caught:
+            mail_saved.show("Budget")
+        self.assertEqual(caught.exception.code, "saved_search_not_found")
+
+    def test_replace_is_case_insensitive_and_keeps_created(self):
+        mail_saved.save("Invoices", query="invoice")
+        created = mail_saved.show("Invoices")["saved_search"]["created"]
+        again = mail_saved.save("INVOICES", query="invoice OR bill", unread_only=True)
+        self.assertTrue(again["replaced"])
+        self.assertEqual(mail_saved.list_all()["count"], 1)
+        entry = mail_saved.show("invoices")["saved_search"]
+        self.assertEqual(entry["created"], created)
+        self.assertEqual(entry["name"], "INVOICES")
+        self.assertEqual(entry["params"], {"query": "invoice OR bill", "unread_only": True})
+
+    def test_name_and_parameter_validation(self):
+        for bad in ("", "   ", None, "-flag", "a/b", "x" * 65, "semi;colon"):
+            with self.assertRaises(MailError) as caught:
+                mail_saved.save(bad, query="x")
+            self.assertEqual(caught.exception.code, "invalid_name", bad)
+        for parameters in ({"query": " "}, {"query": "x", "limit": True},
+                           {"query": "x", "sort": "random"}, {"query": "x", "unread_only": "yes"}):
+            with self.assertRaises(MailError) as caught:
+                mail_saved.save("Ok", **parameters)
+            self.assertEqual(caught.exception.code, "invalid_parameter", parameters)
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_accented_names_are_accepted(self):
+        mail_saved.save("Factures à relancer", query="facture")
+        self.assertEqual(mail_saved.show("factures à relancer")["saved_search"]["name"], "Factures à relancer")
+
+    def test_run_passes_stored_parameters_and_overrides(self):
+        mail_saved.save("Weekly", query="is:unread newer_than:7d", account="Work", limit=50)
+        with mock.patch.object(mail_search, "search_all", return_value={"ok": True, "results": []}) as search:
+            answer = mail_saved.run("weekly", limit=5, sort="date")
+        self.assertEqual(answer, {"ok": True, "results": []})
+        search.assert_called_once_with(query="is:unread newer_than:7d", account="Work", limit=5, sort="date")
+
+    def test_relative_date_operator_is_stored_as_written(self):
+        mail_saved.save("Recent", query="newer_than:7d from:@example.com")
+        with open(self.path, encoding="utf-8") as handle:
+            raw = handle.read()
+        self.assertIn("newer_than:7d", raw)
+        with mock.patch.object(mail_search, "search_all", return_value={"ok": True}) as search:
+            mail_saved.run("Recent")
+        self.assertEqual(search.call_args.kwargs["query"], "newer_than:7d from:@example.com")
+
+    def test_write_is_atomic(self):
+        mail_saved.save("Keep", query="one")
+        with open(self.path, encoding="utf-8") as handle:
+            before = handle.read()
+        with mock.patch.object(os, "replace", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                mail_saved.save("Other", query="two")
+        with open(self.path, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), before)
+        self.assertEqual(os.listdir(os.path.dirname(self.path)), ["saved.json"])
+
+    def test_corrupt_file_is_a_clear_error_and_is_not_overwritten(self):
+        os.makedirs(os.path.dirname(self.path))
+        for content in ("{ not json", '{"searches": "nope"}', "[]"):
+            with open(self.path, "w", encoding="utf-8") as handle:
+                handle.write(content)
+            for call in (mail_saved.list_all, lambda: mail_saved.save("A", query="x")):
+                with self.assertRaises(MailError) as caught:
+                    call()
+                self.assertEqual(caught.exception.code, "saved_searches_corrupt")
+            with open(self.path, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), content)
+
+    def test_run_rejects_a_bad_stored_parameter(self):
+        os.makedirs(os.path.dirname(self.path))
+        bad = {"name": "Bad", "params": {"query": "x", "limit": "5"}}
+        with open(self.path, "w", encoding="utf-8") as handle:
+            json.dump({"version": 1, "searches": [bad]}, handle)
+        with self.assertRaises(MailError) as caught:
+            mail_saved.run("Bad")
+        self.assertEqual(caught.exception.code, "saved_searches_corrupt")
+        self.assertIn("'Bad'", caught.exception.message)
+
+    def test_run_false_overrides_stored_true_and_limit_zero_is_accepted(self):
+        mail_saved.save("Flags", query="x", unread_only=True, limit=0)
+        with mock.patch.object(mail_search, "search_all", return_value={"ok": True}) as search:
+            mail_saved.run("Flags", unread_only=False)
+        self.assertEqual(search.call_args.kwargs, {"query": "x", "unread_only": False, "limit": 0})
+
+
+class SavedSearchPathTests(unittest.TestCase):
+    def test_default_path_is_beside_the_index(self):
+        environment = {"MAIL_MCP_INDEX_PATH": "/scratch/index.sqlite", "MAIL_MCP_SAVED_SEARCHES_PATH": ""}
+        with mock.patch.dict(os.environ, environment):
+            self.assertEqual(mail_saved.storage_path(), "/scratch/saved_searches.json")
+        environment["MAIL_MCP_SAVED_SEARCHES_PATH"] = "/elsewhere/mine.json"
+        with mock.patch.dict(os.environ, environment):
+            self.assertEqual(mail_saved.storage_path(), "/elsewhere/mine.json")
 
 
 if __name__ == "__main__":

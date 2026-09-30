@@ -67,6 +67,9 @@ DEFAULTS: dict[str, Any] = {
     # mail_attachments.py --sync in the background (only once the attachment
     # index exists).
     "attachments_auto_sync": True,
+    # Named searches (the saved_search tool). Empty means saved_searches.json
+    # beside the search index; it is gitignored, and holds queries, not mail.
+    "saved_searches_path": "",
 }
 
 _FILE_VALUES: dict[str, Any] | None = None

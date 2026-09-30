@@ -20,5 +20,7 @@
   "attachments_ocr_images": true,
   "attachments_max_mb": 20,
   "attachments_char_limit": 100000,
-  "attachments_auto_sync": true
+  "attachments_auto_sync": true,
+
+  "saved_searches_path": ""
 }

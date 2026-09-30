@@ -18,6 +18,11 @@ index.sqlite.sync.lock.stale.*
 # Drafts, their archive and the sent ledger hold real message content
 mails/
 
+# Named searches (saved_search tool)
+saved_searches.json
+saved_searches.json.*
+.saved_searches.*.tmp
+
 # Background sync agent output
 launchd/sync.log
 
