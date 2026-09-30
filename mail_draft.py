@@ -339,6 +339,10 @@ def reply_recipients(
     to To, one asked for in Cc that is already in To stays there, and a blind
     copy never repeats a visible recipient. An explicit request wins over the
     usual filtering, so the account's own address is kept if it is asked for.
+
+    Answering a message the user sent themselves goes back to its recipients,
+    as Mail and Gmail do: its To stays To and, with reply_all, its Cc stays Cc.
+    Only when nobody but the user was on it does the reply go to the user.
     """
     extra_to = _explicit_addresses(add_to, "add_to")
     extra_cc = _explicit_addresses(add_cc, "add_cc")
@@ -350,29 +354,56 @@ def reply_recipients(
             "The message being answered names no sender to reply to.",
         )
 
-    account = resolve_account(None)
-    for candidate in accounts():
-        if candidate["name"] == original.get("account"):
-            account = candidate
-            break
-    mine = set(account["addresses"])
-    from_address = next(
-        (
-            address
-            for address in _addresses_of(original.get("to", ""), original.get("cc", ""))
-            if address.lower() in mine
-        ),
-        account["addresses"][0] if account["addresses"] else "",
+    known = accounts()
+    account = next(
+        (candidate for candidate in known if candidate["name"] == original.get("account")),
+        None,
+    ) or resolve_account(None)
+    # Every account counts: a message sent from one of them to another is
+    # still the user writing to themselves.
+    mine = {address.lower() for candidate in known + [account] for address in candidate["addresses"]}
+    own_sender = next(
+        (address for address in _addresses_of(original.get("sender") or "") if address.lower() in mine),
+        None,
     )
+    sent_by_me = all(address.lower() in mine for address in answer_to)
 
     copies: list[str] = []
-    if reply_all:
-        answered = {address.lower() for address in answer_to}
-        copies = [
-            address
-            for address in _addresses_of(original.get("to", ""), original.get("cc", ""))
-            if address.lower() not in mine and address.lower() not in answered
+    if sent_by_me:
+        from_address = own_sender or answer_to[0]
+        original_to = [
+            address for address in _addresses_of(original.get("to", "")) if address.lower() not in mine
         ]
+        if reply_all:
+            in_original_to = {address.lower() for address in original_to}
+            copies = [
+                address
+                for address in _addresses_of(original.get("cc", ""))
+                if address.lower() not in mine and address.lower() not in in_original_to
+            ]
+        if not original_to:
+            # A reply needs someone in To: the copies move up, and a message
+            # the user sent to themselves alone is answered to themselves,
+            # unless add_to already names someone else.
+            original_to, copies = copies, []
+        if original_to or extra_to:
+            answer_to = original_to
+    else:
+        from_address = next(
+            (
+                address
+                for address in _addresses_of(original.get("to", ""), original.get("cc", ""))
+                if address.lower() in {own.lower() for own in account["addresses"]}
+            ),
+            account["addresses"][0] if account["addresses"] else "",
+        )
+        if reply_all:
+            answered = {address.lower() for address in answer_to}
+            copies = [
+                address
+                for address in _addresses_of(original.get("to", ""), original.get("cc", ""))
+                if address.lower() not in mine and address.lower() not in answered
+            ]
 
     computed = {address.lower() for address in answer_to + copies}
     to = list(answer_to)

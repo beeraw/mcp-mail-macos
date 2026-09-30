@@ -759,6 +759,93 @@ class ReplyExtraRecipientsTests(unittest.TestCase):
                     self._recipients(**{parameter: ["not an address"]})
                 self.assertEqual(caught.exception.code, "invalid_address")
 
+    OWN = {
+        "sender": "Me <me@example.com>",
+        "to": "Bob <bob@example.org>, carol@example.org",
+        "cc": "dave@example.org, me@example.com",
+    }
+
+    def _own_recipients(self, reply_all=True, **fields_and_extra):
+        original = dict(self.ORIGINAL, **self.OWN)
+        for field in ("sender", "reply_to", "to", "cc"):
+            if field in fields_and_extra:
+                original[field] = fields_and_extra.pop(field)
+        return mail_draft.reply_recipients(original, reply_all, **fields_and_extra)
+
+    def test_answering_a_received_message_replies_to_its_sender(self):
+        found = self._recipients()
+        self.assertEqual(found["from_address"], "me@example.com")
+        self.assertNotIn("me@example.com", found["to"] + found["cc"])
+
+    def test_answering_my_own_message_goes_back_to_its_recipients(self):
+        found = self._own_recipients()
+        self.assertEqual(found["to"], ["bob@example.org", "carol@example.org"])
+        self.assertEqual(found["cc"], ["dave@example.org"])
+        self.assertEqual(found["from_address"], "me@example.com")
+        self.assertEqual(found["added"], [])
+
+    def test_answering_my_own_message_without_reply_all_keeps_only_its_to(self):
+        found = self._own_recipients(reply_all=False)
+        self.assertEqual(found["to"], ["bob@example.org", "carol@example.org"])
+        self.assertEqual(found["cc"], [])
+
+    def test_a_message_sent_to_myself_alone_is_answered_to_myself(self):
+        for reply_all in (True, False):
+            with self.subTest(reply_all=reply_all):
+                found = self._own_recipients(reply_all, to="me@example.com", cc="")
+                self.assertEqual(found["to"], ["me@example.com"])
+                self.assertEqual(found["cc"], [])
+
+    def test_my_own_message_with_only_copies_moves_them_up_to_to(self):
+        found = self._own_recipients(to="me@example.com", cc="dave@example.org")
+        self.assertEqual(found["to"], ["dave@example.org"])
+        self.assertEqual(found["cc"], [])
+
+    def test_my_address_is_recognised_whatever_its_case(self):
+        found = self._own_recipients(sender="ME@Example.COM", cc="dave@example.org, Me@EXAMPLE.com")
+        self.assertEqual(found["to"], ["bob@example.org", "carol@example.org"])
+        self.assertEqual(found["cc"], ["dave@example.org"])
+        self.assertEqual(found["from_address"], "ME@Example.COM")
+
+    def test_an_account_address_stored_in_capitals_still_matches(self):
+        account = {"name": "Work", "id": "ACCOUNT-UUID", "type": "imap", "addresses": ["Me@Example.com"]}
+        _Patch(self)(mail_draft, "accounts", lambda: [account])
+        found = self._own_recipients()
+        self.assertEqual(found["to"], ["bob@example.org", "carol@example.org"])
+        self.assertEqual(found["cc"], ["dave@example.org"])
+
+    def test_a_reply_to_of_mine_counts_as_my_own_message(self):
+        found = self._own_recipients(sender="assistant@example.org", reply_to="me@example.com")
+        self.assertEqual(found["to"], ["bob@example.org", "carol@example.org"])
+
+    def test_additions_combine_with_an_answer_to_my_own_message(self):
+        found = self._own_recipients(add_to="dave@example.org", add_cc="erin@example.org")
+        self.assertEqual(found["to"], ["bob@example.org", "carol@example.org", "dave@example.org"])
+        self.assertEqual(found["cc"], ["erin@example.org"])
+        self.assertEqual(found["added"], ["erin@example.org"])
+
+    def test_my_address_is_kept_on_my_own_message_only_when_asked_for(self):
+        found = self._own_recipients(reply_all=False, add_cc="me@example.com")
+        self.assertEqual(found["to"], ["bob@example.org", "carol@example.org"])
+        self.assertEqual(found["cc"], ["me@example.com"])
+        found = self._own_recipients(add_to="me@example.com")
+        self.assertIn("me@example.com", found["to"])
+
+    def test_additions_combine_with_a_message_sent_to_myself_alone(self):
+        found = self._own_recipients(to="me@example.com", cc="", add_to="bob@example.org")
+        self.assertEqual(found["to"], ["bob@example.org"])
+        self.assertEqual(found["added"], ["bob@example.org"])
+
+    def test_the_preview_of_an_answer_to_my_own_message(self):
+        _Patch(self)(
+            mail_tools,
+            "get_message",
+            lambda message_id, max_body_chars=0: dict(self.ORIGINAL, **self.OWN),
+        )
+        shown = mail_tools.reply_to_message("id", "Thanks")["preview"]
+        self.assertEqual(shown["will_go_to"], "bob@example.org, carol@example.org")
+        self.assertEqual(shown["copied_to"], "dave@example.org")
+
     def test_the_preview_shows_added_and_blind_recipients(self):
         preview = mail_tools.reply_to_message(
             "id", "Thanks", add_to="dave@example.org", bcc="erin@example.org"
