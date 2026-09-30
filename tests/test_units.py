@@ -4289,5 +4289,103 @@ class EvalModeTests(unittest.TestCase):
                 mail_eval.run_pairs([{"query": "budget", "expected": 7}], mode="semantic")
 
 
+class FindSimilarTests(_VectorsMixin, unittest.TestCase):
+    """find_similar (MCPMAILMAC-13): neighbours of a stored message, no embedding call."""
+
+    # 1 and 2 are one conversation; 3 is close to them, 4 further, 5 unrelated,
+    # 6 has no body text that gets embedded (its vectors are deleted below).
+    BODIES = {1: "roadmap strategy plan", 2: "roadmap strategy plan", 3: "roadmap strategy budget",
+              4: "roadmap weather lunch cost", 5: "budget finance", 6: "budget finance"}
+
+    def setUp(self):
+        super().setUp()
+        with sqlite3.connect(self.path) as connection:
+            connection.execute("UPDATE messages SET conversation_id = 7 WHERE id IN (1, 2)")
+        self.build()
+        with sqlite3.connect(self.vectors_path) as connection:
+            connection.execute("DELETE FROM chunks WHERE message = 6")
+            connection.execute("DELETE FROM messages WHERE message = 6")
+        self.embedder.calls.clear()
+
+    def similar(self, message_id=1, **kwargs):
+        return mail_search.find_similar(message_id, **kwargs)
+
+    def ids(self, message_id=1, **kwargs):
+        return [message["mail_id"] for message in self.similar(message_id, **kwargs)["messages"]]
+
+    def test_the_message_itself_is_never_returned(self):
+        self.assertNotIn(1, self.ids(exclude_thread=False))
+        self.assertNotIn(3, self.ids(3))
+
+    def test_the_conversation_is_excluded_by_default_and_kept_on_request(self):
+        self.assertNotIn(2, self.ids())
+        self.assertEqual(self.ids(exclude_thread=False)[0], 2)
+
+    def test_results_come_closest_first_with_a_score(self):
+        result = self.similar()
+        self.assertEqual([m["mail_id"] for m in result["messages"]], [3, 4, 5])
+        scores = [m["score"] for m in result["messages"]]
+        self.assertEqual(scores, sorted(scores, reverse=True))
+        self.assertTrue(all(key in result["messages"][0] for key in ("subject", "sender", "date_received", "message_id")))
+
+    def test_limit_caps_the_list(self):
+        self.assertEqual(self.ids(limit=2), [3, 4])
+
+    def test_it_accepts_a_mail_id_a_string_id_and_an_encoded_reference(self):
+        reference = mail_search.search_all("roadmap", max_age_minutes=10**9)["messages"][0]
+        self.assertEqual(self.ids(reference["message_id"]), self.ids(reference["mail_id"]))
+        self.assertEqual(self.ids("1"), self.ids(1))
+
+    def test_operators_and_dates_filter_the_neighbours(self):
+        self.assertEqual(self.ids(query="from:john@example.org", exclude_thread=False), [2])
+        self.assertEqual(self.ids(query="from:nobody@example.com"), [])
+        self.assertEqual(self.ids(since="2999-01-01"), [])
+        self.assertEqual(self.ids(account="Home"), [])
+
+    def test_plain_words_in_the_query_must_appear_in_the_message(self):
+        self.assertEqual(self.ids(query="quarterly"), [4, 5])
+        self.assertEqual(self.ids(query="quarterly from:jane@example.com"), [4, 5])
+
+    def test_a_narrow_filter_is_applied_before_the_candidate_cap(self):
+        with mock.patch.object(mail_search, "SIMILAR_MIN_CHUNKS", 1), \
+                mock.patch.object(mail_search, "SIMILAR_CHUNKS_PER_RESULT", 1):
+            self.assertEqual(self.ids(query="quarterly", limit=1), [4])
+
+    def test_a_message_without_vectors_is_a_clear_error(self):
+        with self.assertRaises(MailError) as caught:
+            self.similar(6)
+        self.assertEqual(caught.exception.code, "no_vectors")
+        self.assertIn("mail_vectors.py --sync", caught.exception.hint)
+
+    def test_a_message_missing_from_the_index_is_an_error(self):
+        with self.assertRaises(MailError) as caught:
+            self.similar(999)
+        self.assertEqual(caught.exception.code, "not_indexed")
+
+    def test_a_missing_vectors_file_is_an_error_with_a_hint(self):
+        os.remove(self.vectors_path)
+        with self.assertRaises(MailError) as caught:
+            self.similar()
+        self.assertEqual(caught.exception.code, "vectors_missing")
+
+    def test_it_never_calls_the_embedding_server(self):
+        self.embedder.fail = EmbedderError("Ollama is not reachable")
+        self.assertEqual(self.ids(), [3, 4, 5])
+        self.assertEqual(self.embedder.calls, [])
+
+    def test_the_python_fallback_ranks_the_same_way(self):
+        with mock.patch.object(mail_vectors, "load_sqlite_vec", lambda connection: False):
+            self.assertEqual(self.ids(), [3, 4, 5])
+
+    def test_a_message_vector_is_the_mean_of_its_unit_chunks(self):
+        with sqlite3.connect(self.vectors_path) as connection:
+            connection.execute("DELETE FROM chunks WHERE message = 1")
+            for number, vector in enumerate(([10, 0, 0], [0, 100, 0])):
+                connection.execute(
+                    "INSERT INTO chunks (message, chunk, source, vector) VALUES (1, ?, 'body', ?)",
+                    (number, mail_vectors.quantize(vector)))
+        self.assertEqual([round(value, 2) for value in mail_vectors.message_vector(1)], [0.5, 0.5, 0.0])
+
+
 if __name__ == "__main__":
     unittest.main()

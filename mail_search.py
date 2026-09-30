@@ -584,6 +584,43 @@ def _fuse(
     return ordered
 
 
+def _message_entry(connection: sqlite3.Connection, row: Any, sizes: dict[tuple[str, str], int]) -> dict[str, Any] | None:
+    """One search result as returned to the caller; None when no mailbox still holds the message."""
+    locations = connection.execute(
+        "SELECT account, mailbox, read, flagged FROM locations WHERE message = ?",
+        (row["id"],),
+    ).fetchall()
+    chosen = _pick_location(locations, sizes)
+    if chosen is None:
+        return None
+    reference = MessageReference(
+        account=chosen["account"],
+        mailbox=chosen["mailbox"],
+        identifier=row["id"],
+    )
+    return {
+        "message_id": reference.encode(),
+        "mail_id": row["id"],
+        "subject": row["subject"] or "",
+        "sender": row["sender"] or "",
+        "date_received": datetime.fromtimestamp(
+            row["date_received"] or 0, tz=timezone.utc
+        ).astimezone().isoformat(),
+        "account": chosen["account"],
+        "mailbox": chosen["mailbox"],
+        "also_in": [
+            location["mailbox"]
+            for location in locations
+            if location["mailbox"] != chosen["mailbox"]
+        ],
+        "read": bool(chosen["read"]),
+        "flagged": bool(chosen["flagged"]),
+        "rfc_message_id": row["rfc_id"] or "",
+        "has_attachment": bool(row["has_attachment"]),
+        "is_bulk": bool(row["is_bulk"]),
+    }
+
+
 def search_all(
     query: str,
     account: str | None = None,
@@ -777,41 +814,10 @@ def search_all(
         store = _mail_store() if snippets else None
         messages = []
         for row in rows:
-            locations = connection.execute(
-                "SELECT account, mailbox, read, flagged FROM locations WHERE message = ?",
-                (row["id"],),
-            ).fetchall()
-            chosen = _pick_location(locations, sizes)
-            if chosen is None:
+            entry = _message_entry(connection, row, sizes)
+            if entry is None:
                 continue
-            reference = MessageReference(
-                account=chosen["account"],
-                mailbox=chosen["mailbox"],
-                identifier=row["id"],
-            )
-            messages.append(
-                {
-                    "message_id": reference.encode(),
-                    "mail_id": row["id"],
-                    "subject": row["subject"] or "",
-                    "sender": row["sender"] or "",
-                    "date_received": datetime.fromtimestamp(
-                        row["date_received"] or 0, tz=timezone.utc
-                    ).astimezone().isoformat(),
-                    "account": chosen["account"],
-                    "mailbox": chosen["mailbox"],
-                    "also_in": [
-                        location["mailbox"]
-                        for location in locations
-                        if location["mailbox"] != chosen["mailbox"]
-                    ],
-                    "read": bool(chosen["read"]),
-                    "flagged": bool(chosen["flagged"]),
-                    "rfc_message_id": row["rfc_id"] or "",
-                    "has_attachment": bool(row["has_attachment"]),
-                    "is_bulk": bool(row["is_bulk"]),
-                }
-            )
+            messages.append(entry)
             hit = attachment_hits.get(row["id"])
             if hit is not None:
                 messages[-1]["attachment_match"] = {"filename": hit.filename}
@@ -1119,6 +1125,131 @@ def get_thread(message_id: str, limit: int = 100) -> dict[str, Any]:
             "message_count": len(messages),
             "messages": messages,
         }
+    finally:
+        connection.close()
+
+
+# Chunks compared per similar-message query: a message and its thread hold many
+# near-identical chunks, so far more are pulled than `limit` messages need.
+SIMILAR_CHUNKS_PER_RESULT = 30
+SIMILAR_MIN_CHUNKS = 200
+
+
+def _index_id(message_id: str | int) -> int:
+    """The index id behind a message_id: an encoded reference, or the bare mail_id search_all returns."""
+    if isinstance(message_id, int) or str(message_id).strip().isdigit():
+        return int(str(message_id).strip())
+    return MessageReference.decode(message_id).identifier
+
+
+def find_similar(
+    message_id: str | int,
+    query: str = "",
+    account: str | None = None,
+    mailbox: str | None = None,
+    unread_only: bool = False,
+    flagged_only: bool = False,
+    since: str | None = None,
+    until: str | None = None,
+    limit: int = 10,
+    exclude_thread: bool = True,
+    snippets: bool = True,
+) -> dict[str, Any]:
+    """Messages whose meaning is closest to a given message, best first.
+
+    The query vector is the message's own stored chunk vectors averaged
+    (mail_vectors.message_vector), so nothing is embedded and Ollama is not
+    needed. The message itself is left out, and with exclude_thread its whole
+    conversation, so what comes back is other mail on the same subject.
+    `query` narrows the candidates like search_all's: Gmail operators become
+    filters, any remaining words must appear in the message (keywords).
+    """
+    import mail_vectors
+
+    limit = max(1, min(int(limit), 200))
+    identifier = _index_id(message_id)
+    parsed = mail_operators.parse(query or "")
+    since_ts = _as_timestamp(since)
+    until_ts = _as_timestamp(until, end_of_day=True)
+
+    connection = _connect()
+    try:
+        row = connection.execute(
+            "SELECT conversation_id FROM messages WHERE id = ?", (identifier,)).fetchone()
+        if row is None:
+            raise MailError(
+                "not_indexed",
+                "This message is not in the index.",
+                "It may be newer than the last sync; run sync_index and try again.",
+            )
+        excluded = {identifier}
+        if exclude_thread and row["conversation_id"] is not None:
+            excluded.update(found[0] for found in connection.execute(
+                "SELECT id FROM messages WHERE conversation_id = ?", (row["conversation_id"],)))
+
+        vector = mail_vectors.message_vector(identifier)
+
+        name_clause, conditions, parameters = _message_filters(
+            parsed, since_ts, until_ts, account, mailbox, unread_only, flagged_only)
+        words = _legacy_column_filters(parsed.free_text)
+        if words.strip():
+            expression = _match_expression(words, True, "")
+            try:
+                connection.execute(
+                    "SELECT 1 FROM messages_fts WHERE messages_fts MATCH ? LIMIT 1", (expression,)).fetchone()
+            except sqlite3.OperationalError:
+                expression = _match_expression(_quote_terms(words), True, "")
+            conditions.append("m.id IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)")
+            parameters.append(expression)
+        allowed, narrow = _allowed_ids(connection, conditions, parameters, name_clause)
+        if allowed is not None:
+            allowed = [number for number in allowed if number not in excluded]
+        chunks = max(SIMILAR_MIN_CHUNKS, limit * SIMILAR_CHUNKS_PER_RESULT) * (5 if narrow else 1)
+        hits = mail_vectors.search_hits(vector, allowed, chunks, excluded=excluded)
+
+        # Rows come from the index under the same filters, which also covers a
+        # filter set too large to hand to the vectors search.
+        if name_clause:
+            conditions.append("m.id IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)")
+            parameters.append(name_clause)
+        by_id: dict[int, Any] = {}
+        for start in range(0, len(hits), 500):
+            group = [hit.message for hit in hits[start:start + 500]]
+            for found in connection.execute(
+                "SELECT m.id, m.account, m.subject, m.sender, m.date_received, m.rfc_id,"
+                "       m.has_attachment, m.is_bulk FROM messages m WHERE "
+                + " AND ".join([*conditions, f"m.id IN ({','.join('?' * len(group))})"]),
+                (*parameters, *group),
+            ):
+                by_id[found["id"]] = found
+
+        sizes = _mailbox_sizes(connection)
+        store = _mail_store() if snippets else None
+        messages = []
+        for hit in hits:
+            if len(messages) >= limit:
+                break
+            found = by_id.get(hit.message)
+            entry = _message_entry(connection, found, sizes) if found is not None else None
+            if entry is None:
+                continue
+            entry["score"] = round(hit.score, 3)
+            if snippets:
+                entry["snippet"] = mail_vectors.chunk_excerpt(
+                    store, hit.message, found["subject"] or "", hit.chunk)
+            messages.append(entry)
+
+        result: dict[str, Any] = {
+            "ok": True,
+            "source_mail_id": identifier,
+            "exclude_thread": bool(exclude_thread),
+            "filters": mail_operators.describe(parsed.filters),
+            "messages": messages,
+        }
+        note = _coverage_note(connection)
+        if note:
+            result["semantic_note"] = note
+        return result
     finally:
         connection.close()
 

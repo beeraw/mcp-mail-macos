@@ -196,6 +196,59 @@ def search_all(
 
 
 @mcp.tool()
+def find_similar(
+    message_id: str,
+    query: str = "",
+    account: str | None = None,
+    mailbox: str | None = None,
+    unread_only: bool = False,
+    flagged_only: bool = False,
+    since: str | None = None,
+    until: str | None = None,
+    limit: int = 10,
+    exclude_thread: bool = True,
+    snippets: bool = True,
+) -> dict[str, Any]:
+    """Find the messages closest in meaning to a given message ("more like this").
+
+    Compares the message's stored embeddings with everyone else's, so it works
+    without Ollama and answers in about a tenth of a second. Needs the vectors
+    index (mail_vectors.py --sync); a message not embedded yet is an error with
+    that hint. The message itself is never returned.
+
+    Args:
+        message_id: a message_id from search_all or list_messages (search_all's
+            numeric mail_id works too).
+        query: optional narrowing, same syntax as search_all: Gmail operators
+            (from:, has:attachment, newer_than:1y, is:unread...) filter the
+            candidates, and any plain words must appear in the message.
+        account, mailbox, unread_only, flagged_only, since, until: filters, as
+            in search_all.
+        limit: how many messages to return (max 200).
+        exclude_thread: leave out the message's own conversation (default), so
+            you get other mail on the subject; false keeps the replies.
+        snippets: add the passage that matched (about 200 characters).
+
+    Each result looks like a search_all one, with "score" (cosine similarity of
+    the best passage, higher is closer).
+    """
+    return _guard(
+        mail_search.find_similar,
+        message_id=message_id,
+        query=query,
+        account=account,
+        mailbox=mailbox,
+        unread_only=unread_only,
+        flagged_only=flagged_only,
+        since=since,
+        until=until,
+        limit=limit,
+        exclude_thread=exclude_thread,
+        snippets=snippets,
+    )
+
+
+@mcp.tool()
 def aggregate(
     group_by: str,
     query: str = "",

@@ -662,36 +662,51 @@ def _connect_readonly(path: str) -> sqlite3.Connection:
     return connection
 
 
+def _open_readonly(path: str | None, model: str | None) -> sqlite3.Connection:
+    """The vectors file opened for a search; MailError when absent or unreadable."""
+    path = path or database_path()
+    if not os.path.isfile(path):
+        raise MailError("vectors_missing", "The vectors file has not been built.",
+                        "Build it: python3 mail_vectors.py --build")
+    try:
+        return open_database(path, model, create=False)
+    except sqlite3.DatabaseError as error:
+        raise MailError("vectors_invalid", f"The vectors file is unreadable: {error}") from error
+
+
 def search_hits(
     query_vector: list[float],
     allowed: list[int] | None = None,
     limit_chunks: int = CANDIDATE_CHUNKS,
     path: str | None = None,
     model: str | None = None,
+    excluded: Iterable[int] | None = None,
 ) -> list[Hit]:
     """Messages nearest to the query vector, best first, one entry per message.
 
     `allowed` restricts the search to those message ids (the filters of the
     query: operators, dates, account...), applied before ranking so a narrow
-    filter never loses its hits to the global nearest neighbours. A message
-    scores as its best chunk.
+    filter never loses its hits to the global nearest neighbours. `excluded`
+    removes ids the same way (a similarity search leaves out the message it
+    starts from, whose own chunks would otherwise fill the candidates). A
+    message scores as its best chunk.
     """
-    path = path or database_path()
-    if not os.path.isfile(path):
-        raise MailError("vectors_missing", "The vectors file has not been built.",
-                        "Build it: python3 mail_vectors.py --build")
-    try:
-        connection = open_database(path, model, create=False)
-    except sqlite3.DatabaseError as error:
-        raise MailError("vectors_invalid", f"The vectors file is unreadable: {error}") from error
+    connection = _open_readonly(path, model)
     try:
         query = quantize(query_vector)
         if allowed is not None and not allowed:
             return []
+        conditions = []
         if allowed is not None:
             connection.execute("CREATE TEMP TABLE wanted (message INTEGER PRIMARY KEY)")
             connection.executemany("INSERT OR IGNORE INTO wanted VALUES (?)", ((i,) for i in allowed))
-        restriction = " WHERE message IN (SELECT message FROM wanted)" if allowed is not None else ""
+            conditions.append("message IN (SELECT message FROM wanted)")
+        excluded = list(excluded or ())
+        if excluded:
+            connection.execute("CREATE TEMP TABLE unwanted (message INTEGER PRIMARY KEY)")
+            connection.executemany("INSERT OR IGNORE INTO unwanted VALUES (?)", ((i,) for i in excluded))
+            conditions.append("message NOT IN (SELECT message FROM unwanted)")
+        restriction = " WHERE " + " AND ".join(conditions) if conditions else ""
         if load_sqlite_vec(connection):
             rows = connection.execute(
                 "SELECT message, chunk, 1.0 - vec_distance_cosine(vec_int8(vector), vec_int8(?)) AS similarity"
@@ -724,6 +739,40 @@ def search_hits(
         if message not in best:  # rows come best first
             best[message] = Hit(message, float(similarity), chunk)
     return sorted(best.values(), key=lambda hit: -hit.score)
+
+
+def message_vector(identifier: int, path: str | None = None, model: str | None = None) -> list[float]:
+    """One vector standing for a whole message: the mean of its chunk vectors.
+
+    Each chunk is brought to unit length first, so a long message is not tilted
+    towards the chunks whose int8 scale happened to be larger. Measured against
+    taking each chunk as a query and keeping the best score per message, the
+    neighbours are as on-topic and it costs one scan instead of up to eight.
+    MailError when the message has no vectors (not embedded yet, or no body).
+    """
+    connection = _open_readonly(path, model)
+    try:
+        rows = connection.execute(
+            "SELECT vector FROM chunks WHERE message = ? ORDER BY chunk", (identifier,)).fetchall()
+    except sqlite3.DatabaseError as error:
+        raise MailError("vectors_invalid", f"The vectors file cannot be read: {error}") from error
+    finally:
+        connection.close()
+    if not rows:
+        raise MailError(
+            "no_vectors",
+            "This message has no embedding, so its meaning cannot be compared.",
+            "It may be newer than the last vectors sync or have no text: python3 mail_vectors.py --sync",
+        )
+    total: list[float] | None = None
+    for row in rows:
+        values = array.array("b", row[0])
+        norm = math.sqrt(sum(value * value for value in values)) or 1.0
+        if total is None:
+            total = [0.0] * len(values)
+        for position, value in enumerate(values):
+            total[position] += value / norm
+    return [value / len(rows) for value in total or []]
 
 
 def chunk_excerpt(store: str | None, identifier: int, subject: str, chunk: int, length: int = 200) -> str | None:

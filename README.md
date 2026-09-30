@@ -27,10 +27,11 @@ accounts, on a mailbox of roughly 50,000 messages spanning several years.
 - [macOS permissions](#macos-permissions)
 - [Add to Claude Code](#add-to-claude-code)
 - [Configuration](#configuration)
-- [The 26 tools](#the-26-tools)
+- [The 27 tools](#the-27-tools)
 - [Drafts are files, not Mail drafts](#drafts-are-files-not-mail-drafts)
 - [The search index](#the-search-index)
   - [Search by meaning](#search-by-meaning)
+  - [Similar messages](#similar-messages)
 - [Message identifiers](#message-identifiers)
 - [Response format](#response-format)
 - [Known limitations](#known-limitations)
@@ -279,7 +280,7 @@ in `launchd/com.mcp-mail-macos.sync.plist` before installing it.
 
 ---
 
-## The 26 tools
+## The 27 tools
 
 ### Search across everything
 
@@ -289,6 +290,7 @@ in `launchd/com.mcp-mail-macos.sync.plist` before installing it.
 | `aggregate(group_by, query, account, mailbox, unread_only, flagged_only, since, until, limit, order)` | Count matching messages per sender, domain, month, year, account, mailbox or recipient ("who writes to me most", volumes per month) |
 | `saved_search(action, name, description, query, account, mailbox, unread_only, flagged_only, since, until, limit, sort, snippets)` | Save a frequent search under a name (`save`), re-run it (`run`, with optional overrides), or `list` / `show` / `delete` saved ones |
 | `get_thread(message_id, limit)` | The whole conversation a message belongs to |
+| `find_similar(message_id, query, account, mailbox, unread_only, flagged_only, since, until, limit, exclude_thread, snippets)` | The messages closest in meaning to a given one ("more like this"), from the stored vectors |
 | `index_status()` | What the index holds, how old it is, how many messages have a searchable body (per account and overall), and the state of the attachment and vector indexes |
 | `sync_index()` | Bring the index up to date |
 
@@ -836,6 +838,28 @@ noise for a language model (letterheads, tables, OCR of stamps), and keyword
 search already reaches it: in `hybrid` the keyword side still merges attachment
 hits, so a message found through an attachment word stays in the fused list.
 
+### Similar messages
+
+`find_similar(message_id)` returns the messages whose meaning is closest to a given
+one. It needs the vectors file but neither Ollama nor the network: the query is the
+message's own stored chunk vectors, averaged (each brought to unit length first). The
+message itself is never returned, and with `exclude_thread=True` (the default) neither
+is the rest of its conversation, so the answer is other mail about the subject; pass
+`false` to keep the replies. `message_id` is a `message_id` reference or the numeric
+`mail_id` of `search_all`. `query` narrows the candidates like `search_all`'s: Gmail
+operators, dates, account and mailbox filter them before the nearest-neighbour cut,
+and plain words must appear in the message. Results have the shape of `search_all`'s,
+with `score` (cosine of the best chunk) and the matching passage as `snippet`. A
+message without vectors (newer than the last `mail_vectors.py --sync`, or no text)
+is an error saying so. On the 71,000 chunks above a search takes about 80 ms (100 ms with snippets),
+almost all of it the exact comparison; a filter that leaves fewer chunks is faster.
+
+Averaging the chunks was chosen against keeping the best score over each chunk as a
+query, on 12 random multi-chunk messages (top 10 each, thread excluded): same sender
+in 61 and 69 of 120, a subject word in common in 88 and 83 of 120, against 0 and 12
+for random messages, at 68 ms against 168 ms. The two are as on-topic; the average
+costs one scan instead of up to eight.
+
 ### Evaluating search quality
 
 `mail_eval.py` measures where search puts the message you were looking for, so a
@@ -1061,7 +1085,7 @@ be deleted by hand, since Mail cannot do it through AppleScript.
 
 ```
 mcp-mail-macos/
-├── server.py           # MCP entry point, the 26 tool definitions
+├── server.py           # MCP entry point, the 27 tool definitions
 ├── mail_tools.py       # driving Mail through AppleScript
 ├── mail_message.py     # building the message: body, signature, attachments
 ├── mail_signature.py   # the signature Mail would have used, from its settings
