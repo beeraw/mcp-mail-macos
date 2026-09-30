@@ -178,6 +178,55 @@ def search_all(
 
 
 @mcp.tool()
+def aggregate(
+    group_by: str,
+    query: str = "",
+    account: str | None = None,
+    mailbox: str | None = None,
+    unread_only: bool = False,
+    flagged_only: bool = False,
+    since: str | None = None,
+    until: str | None = None,
+    limit: int = 20,
+    order: str = "count",
+) -> dict[str, Any]:
+    """Count messages grouped by sender, domain, month, year, account or mailbox.
+
+    Answers "who writes to me most", "how much mail per month", "which domains".
+    Takes search_all's query (free text and Gmail operators, optional) and
+    filters, and reads the index only, in milliseconds. Nothing is excluded by
+    default: add "-is:bulk" to leave out newsletters and mailing lists. A message
+    kept in several mailboxes counts once (except group_by="mailbox"). Free text
+    is not matched inside attachments.
+
+    group_by: sender (bare address, with the most frequent display "name"),
+    domain, month (YYYY-MM), year, account, mailbox, recipient or
+    recipient_domain (To and Cc addresses).
+    limit: rows kept, max 500. Rows are {key, count, unread, last_date}, most
+    frequent first (order="last_date": most recent first); month and year come
+    oldest first and limit keeps the newest. "total" counts matching messages,
+    "groups" the distinct keys before limit.
+
+    Examples:
+        aggregate("sender", "to:me -is:bulk", since="2026-01-01", limit=10)
+        aggregate("month", "from:@example.com", account="Work")
+    """
+    return _guard(
+        mail_search.aggregate,
+        group_by=group_by,
+        query=query,
+        account=account,
+        mailbox=mailbox,
+        unread_only=unread_only,
+        flagged_only=flagged_only,
+        since=since,
+        until=until,
+        limit=limit,
+        order=order,
+    )
+
+
+@mcp.tool()
 def get_thread(message_id: str, limit: int = 100) -> dict[str, Any]:
     """List every message of the conversation a message belongs to, oldest first.
 

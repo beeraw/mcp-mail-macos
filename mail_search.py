@@ -324,6 +324,65 @@ def _merge_attachment_hits(
     return ordered[:limit]
 
 
+def _match_expression(text: str, has_text: bool, name_clause: str) -> str:
+    """The FTS5 MATCH expression for the free text plus the filename: clauses."""
+    parts = []
+    if has_text:
+        parts.append(f"({mail_stem.rewrite_query(text)})" if name_clause else mail_stem.rewrite_query(text))
+    if name_clause:
+        parts.append(name_clause)
+    return " AND ".join(parts)
+
+
+def _message_filters(
+    parsed: mail_operators.ParsedQuery,
+    since_ts: int | None,
+    until_ts: int | None,
+    account: str | None,
+    mailbox: str | None,
+    unread_only: bool,
+    flagged_only: bool,
+) -> tuple[str, list[str], list[Any]]:
+    """Everything that narrows a search except the free text, as SQL on `messages m`.
+
+    Shared by search_all and aggregate so both read a query and its filters the
+    same way. Returns (filename FTS clause or "", conditions, parameters); the
+    clause is separate because it is a MATCH and must join the free text's one.
+    """
+    operator_conditions, operator_parameters, wanted_names, unwanted_names = (
+        mail_operators.build_conditions(parsed.filters, _own_addresses)
+    )
+    name_clause = " AND ".join(mail_operators.filename_match(name) for name in wanted_names)
+    conditions: list[str] = []
+    parameters: list[Any] = []
+    for name in unwanted_names:
+        conditions.append("m.id NOT IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)")
+        parameters.append(mail_operators.filename_match(name))
+    conditions.extend(operator_conditions)
+    parameters.extend(operator_parameters)
+    if since_ts:
+        conditions.append("m.date_received >= ?")
+        parameters.append(since_ts)
+    if until_ts:
+        conditions.append("m.date_received <= ?")
+        parameters.append(until_ts)
+    if account:
+        conditions.append("EXISTS (SELECT 1 FROM locations l WHERE l.message = m.id"
+                          " AND lower(l.account) = lower(?))")
+        parameters.append(account)
+    if mailbox:
+        conditions.append("EXISTS (SELECT 1 FROM locations l WHERE l.message = m.id"
+                          " AND lower(l.mailbox) = lower(?))")
+        parameters.append(mailbox)
+    if unread_only:
+        conditions.append("EXISTS (SELECT 1 FROM locations l WHERE l.message = m.id"
+                          " AND l.read = 0)")
+    if flagged_only:
+        conditions.append("EXISTS (SELECT 1 FROM locations l WHERE l.message = m.id"
+                          " AND l.flagged = 1)")
+    return name_clause, conditions, parameters
+
+
 def search_all(
     query: str,
     account: str | None = None,
@@ -367,50 +426,21 @@ def search_all(
 
     connection = _connect()
     try:
-        operator_conditions, operator_parameters, wanted_names, unwanted_names = (
-            mail_operators.build_conditions(parsed.filters, _own_addresses)
-        )
         has_text = bool(query.strip())
         query = _legacy_column_filters(query)
-        name_clause = " AND ".join(mail_operators.filename_match(name) for name in wanted_names)
+        name_clause, filter_conditions, filter_parameters = _message_filters(
+            parsed, since_ts, until_ts, account, mailbox, unread_only, flagged_only,
+        )
 
         def match_expression(text: str) -> str:
-            parts = []
-            if has_text:
-                parts.append(f"({mail_stem.rewrite_query(text)})" if name_clause else mail_stem.rewrite_query(text))
-            if name_clause:
-                parts.append(name_clause)
-            return " AND ".join(parts)
+            return _match_expression(text, has_text, name_clause)
 
-        use_fts = has_text or bool(wanted_names)
+        use_fts = has_text or bool(name_clause)
         conditions: list[str] = ["messages_fts MATCH ?"] if use_fts else []
         parameters: list[Any] = [match_expression(query)] if use_fts else []
         fts_conditions = len(conditions)
-        for name in unwanted_names:
-            conditions.append("m.id NOT IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)")
-            parameters.append(mail_operators.filename_match(name))
-        conditions.extend(operator_conditions)
-        parameters.extend(operator_parameters)
-        if since_ts:
-            conditions.append("m.date_received >= ?")
-            parameters.append(since_ts)
-        if until_ts:
-            conditions.append("m.date_received <= ?")
-            parameters.append(until_ts)
-        if account:
-            conditions.append("EXISTS (SELECT 1 FROM locations l WHERE l.message = m.id"
-                              " AND lower(l.account) = lower(?))")
-            parameters.append(account)
-        if mailbox:
-            conditions.append("EXISTS (SELECT 1 FROM locations l WHERE l.message = m.id"
-                              " AND lower(l.mailbox) = lower(?))")
-            parameters.append(mailbox)
-        if unread_only:
-            conditions.append("EXISTS (SELECT 1 FROM locations l WHERE l.message = m.id"
-                              " AND l.read = 0)")
-        if flagged_only:
-            conditions.append("EXISTS (SELECT 1 FROM locations l WHERE l.message = m.id"
-                              " AND l.flagged = 1)")
+        conditions.extend(filter_conditions)
+        parameters.extend(filter_parameters)
 
         if not has_text:
             sort = "date"  # no free text, so nothing to rank by
@@ -563,6 +593,201 @@ def search_all(
             result["interpreted_as"] = used_query
         if parsed.filters:
             result["original_query"] = original_query
+        return result
+    finally:
+        connection.close()
+
+
+AGGREGATE_GROUPS = ("sender", "domain", "month", "year", "account", "mailbox", "recipient", "recipient_domain")
+# Groupings whose keys are periods: listed oldest first, and `limit` keeps the newest.
+_CHRONOLOGICAL_GROUPS = ("month", "year")
+AGGREGATE_ORDERS = ("count", "last_date")
+
+
+def _bare_address(sender: str | None) -> str:
+    """Lower-cased address of a stored sender ("Name <addr>" or a bare address)."""
+    from email.utils import parseaddr
+
+    return parseaddr(sender or "")[1].strip().lower()
+
+
+def aggregate(
+    group_by: str,
+    query: str = "",
+    account: str | None = None,
+    mailbox: str | None = None,
+    unread_only: bool = False,
+    flagged_only: bool = False,
+    since: str | None = None,
+    until: str | None = None,
+    limit: int = 20,
+    order: str = "count",
+    max_age_minutes: float = config.get("index_max_age_minutes"),
+) -> dict[str, Any]:
+    """Counts the messages matching a query, grouped by sender, domain, period...
+
+    Takes search_all's query (text and Gmail operators, optional) and filters, so
+    "who writes to me most" is aggregate("sender", "to:me") and "volume per month
+    of one client" aggregate("month", "from:@example.com"). Runs as one SQL
+    GROUP BY on the index: no per-message work, so it stays fast without a query.
+    The free text is matched against the message index only, not the text inside
+    attachments. A message held by several mailboxes counts once, except for
+    group_by="mailbox" where it counts in each.
+
+    Rows are {key, count, unread, last_date}, most frequent first (order="last_date":
+    most recent first); month and year come oldest first and `limit` keeps the
+    newest periods. A sender row also carries the most frequent display "name"; a
+    mailbox row its "account". "total" is the number of matching messages,
+    "groups" the number of distinct keys before `limit`.
+    """
+    if group_by not in AGGREGATE_GROUPS:
+        raise MailError(
+            "invalid_group_by",
+            f"Unknown group_by: {group_by!r}.",
+            "Use one of: " + ", ".join(AGGREGATE_GROUPS) + ".",
+        )
+    if order not in AGGREGATE_ORDERS:
+        raise MailError("invalid_order", f"Unknown order: {order!r}.", 'Use "count" or "last_date".')
+    limit = max(1, min(int(limit), 500))
+    parsed = mail_operators.parse(query or "")
+    free_text = parsed.free_text
+    freshness = _refresh_if_stale(max_age_minutes)
+    since_ts = _as_timestamp(since)
+    until_ts = _as_timestamp(until, end_of_day=True)
+
+    connection = _connect()
+    try:
+        has_text = bool(free_text.strip())
+        free_text = _legacy_column_filters(free_text)
+        name_clause, conditions, parameters = _message_filters(
+            parsed, since_ts, until_ts, account, mailbox, unread_only, flagged_only,
+        )
+        use_fts = has_text or bool(name_clause)
+        if use_fts:
+            conditions.insert(0, "messages_fts MATCH ?")
+            parameters.insert(0, _match_expression(free_text, has_text, name_clause))
+        source = "messages_fts f JOIN messages m ON m.id = f.rowid" if use_fts else "messages m"
+        unread = "EXISTS (SELECT 1 FROM locations u WHERE u.message = m.id AND u.read = 0)"
+        month = "strftime('%Y-%m', m.date_received, 'unixepoch', 'localtime')"
+        year = "strftime('%Y', m.date_received, 'unixepoch', 'localtime')"
+
+        join = ""
+        extra = ""
+        extra_parameters: list[Any] = []
+        count_expression = "count(*)"
+        unread_expression = f"sum({unread})"
+        extra_columns = ""
+        if group_by in ("sender", "domain"):
+            # Grouped on the raw stored sender, folded on the bare address below:
+            # parsing "Name <addr>" is Python's job, the GROUP BY stays cheap.
+            key_expression = "m.sender"
+        elif group_by == "month":
+            key_expression = month
+        elif group_by == "year":
+            key_expression = year
+        elif group_by == "account":
+            key_expression = "m.account"
+        elif group_by == "mailbox":
+            join = " JOIN locations l ON l.message = m.id"
+            key_expression = "l.mailbox"
+            extra_columns = ", l.account AS account"
+            unread_expression = "sum(l.read = 0)"
+            # Only the copies asked for: the message filters above match a
+            # message through any of its locations.
+            if mailbox:
+                extra = " AND lower(l.mailbox) = lower(?)"
+                extra_parameters.append(mailbox)
+            if account:
+                extra += " AND lower(l.account) = lower(?)"
+                extra_parameters.append(account)
+        else:  # recipient, recipient_domain
+            join = " JOIN recipients r ON r.message = m.id"
+            key_expression = "r.address" if group_by == "recipient" else "r.domain"
+            count_expression = "count(DISTINCT m.id)"
+            # A message can join several rows of one key (To and Cc, two
+            # addresses of a domain): count it once for unread too.
+            unread_expression = f"count(DISTINCT CASE WHEN {unread} THEN m.id END)"
+        group_expression = key_expression + (", l.account" if group_by == "mailbox" else "")
+        where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+        row_where = (where or " WHERE 1") + extra if extra else where
+        statement = (
+            f"SELECT {key_expression} AS key, {count_expression} AS n, {unread_expression} AS unread,"
+            f" max(m.date_received) AS last{extra_columns}"
+            f" FROM {source}{join}{row_where} GROUP BY {group_expression}"
+        )
+        total_statement = f"SELECT count(*) FROM {source}{where}"
+        used_query = free_text
+        try:
+            rows = connection.execute(statement, [*parameters, *extra_parameters]).fetchall()
+        except sqlite3.OperationalError as error:
+            if not use_fts:
+                raise MailError("invalid_query", f"Unusable query: {error}") from error
+            used_query = _quote_terms(free_text)
+            parameters[0] = _match_expression(used_query, has_text, name_clause)
+            try:
+                rows = connection.execute(statement, [*parameters, *extra_parameters]).fetchall()
+            except sqlite3.OperationalError as error:
+                raise MailError("invalid_query", f"Unusable query: {error}") from error
+
+        groups: dict[str, dict[str, Any]] = {}
+        names: dict[str, dict[str, int]] = {}
+        for row in rows:
+            key = row["key"]
+            if group_by in ("sender", "domain"):
+                address = _bare_address(key)
+                key = address if group_by == "sender" else (address.rsplit("@", 1)[1] if "@" in address else address)
+            key = key if key not in (None, "") else "unknown"
+            slot = groups.setdefault(
+                (key, row["account"]) if group_by == "mailbox" else key, {"key": key, "count": 0, "unread": 0, "last": 0,
+                      **({"account": row["account"]} if group_by == "mailbox" else {})})
+            slot["count"] += row["n"]
+            slot["unread"] += row["unread"] or 0
+            slot["last"] = max(slot["last"], row["last"] or 0)
+            if group_by == "sender":
+                from email.utils import parseaddr
+
+                display = parseaddr(row["key"] or "")[0].strip()
+                if display:
+                    names.setdefault(key, {})[display] = names.setdefault(key, {}).get(display, 0) + row["n"]
+        ordered = list(groups.values())
+        if group_by in _CHRONOLOGICAL_GROUPS:
+            # Undated messages ("unknown") go first, out of the way of the newest periods.
+            ordered.sort(key=lambda item: ("" if item["key"] == "unknown" else item["key"]))
+            ordered = ordered[-limit:]
+        elif order == "last_date":
+            ordered.sort(key=lambda item: (-item["last"], item["key"]))
+            ordered = ordered[:limit]
+        else:
+            ordered.sort(key=lambda item: (-item["count"], item["key"]))
+            ordered = ordered[:limit]
+        results = []
+        for item in ordered:
+            entry = {
+                "key": item["key"],
+                "count": item["count"],
+                "unread": item["unread"],
+                "last_date": datetime.fromtimestamp(item["last"], tz=timezone.utc).astimezone().isoformat()
+                if item["last"] else None,
+            }
+            if group_by == "sender" and item["key"] in names:
+                entry["name"] = max(names[item["key"]].items(), key=lambda pair: (pair[1], pair[0]))[0]
+            if "account" in item:
+                entry["account"] = item["account"]
+            results.append(entry)
+
+        total = connection.execute(total_statement, parameters).fetchone()[0]
+        result: dict[str, Any] = {
+            "ok": True,
+            "group_by": group_by,
+            "query": free_text,
+            "filters": mail_operators.describe(parsed.filters),
+            "total": total,
+            "groups": len(groups),
+            "results": results,
+            **freshness,
+        }
+        if used_query != free_text:
+            result["interpreted_as"] = used_query
         return result
     finally:
         connection.close()

@@ -27,7 +27,7 @@ accounts, on a mailbox of roughly 50,000 messages spanning several years.
 - [macOS permissions](#macos-permissions)
 - [Add to Claude Code](#add-to-claude-code)
 - [Configuration](#configuration)
-- [The 25 tools](#the-25-tools)
+- [The 26 tools](#the-26-tools)
 - [Drafts are files, not Mail drafts](#drafts-are-files-not-mail-drafts)
 - [The search index](#the-search-index)
 - [Message identifiers](#message-identifiers)
@@ -254,13 +254,14 @@ in `launchd/com.mcp-mail-macos.sync.plist` before installing it.
 
 ---
 
-## The 25 tools
+## The 26 tools
 
 ### Search across everything
 
 | Tool | Purpose |
 | --- | --- |
 | `search_all(query, account, mailbox, unread_only, flagged_only, since, until, limit, sort, snippets)` | Search every account, through the local index |
+| `aggregate(group_by, query, account, mailbox, unread_only, flagged_only, since, until, limit, order)` | Count matching messages per sender, domain, month, year, account, mailbox or recipient ("who writes to me most", volumes per month) |
 | `get_thread(message_id, limit)` | The whole conversation a message belongs to |
 | `index_status()` | What the index holds, how old it is, how many messages have a searchable body (per account and overall), and the state of the attachment index |
 | `sync_index()` | Bring the index up to date |
@@ -271,6 +272,13 @@ works — `subject: invoice`, `sender: jane` (`recipients:` searches
 To and Cc together), `AND` / `OR` / `NOT`, `"exact phrase"`, `NEAR(one two, 5)`.
 A query that is not valid FTS5 (`invoice 12/2025`) is reinterpreted word by
 word, which the answer reports in `interpreted_as`.
+
+`aggregate` takes the same query, operators and filters but returns counts
+instead of messages: `aggregate("sender", "to:me -is:bulk", since="2026-01-01")`
+lists who writes most, `aggregate("month", "from:@example.com")` gives the
+volume per month. Nothing is excluded by default; `-is:bulk` leaves out
+newsletters. A message in several mailboxes counts once (except
+`group_by="mailbox"`); text inside attachments is not searched.
 
 #### Operators
 
@@ -916,7 +924,7 @@ be deleted by hand, since Mail cannot do it through AppleScript.
 
 ```
 mcp-mail-macos/
-├── server.py           # MCP entry point, the 25 tool definitions
+├── server.py           # MCP entry point, the 26 tool definitions
 ├── mail_tools.py       # driving Mail through AppleScript
 ├── mail_message.py     # building the message: body, signature, attachments
 ├── mail_signature.py   # the signature Mail would have used, from its settings

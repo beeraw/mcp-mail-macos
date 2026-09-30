@@ -24,6 +24,7 @@ import threading
 import time
 import unicodedata
 import unittest
+from datetime import datetime
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -1529,6 +1530,154 @@ class SearchOperatorTests(unittest.TestCase):
         result = mail_search.search_all("invoice ( from:jane", max_age_minutes=10**9, snippets=False)
         self.assertIn("interpreted_as", result)
         self.assertEqual(result["filters"], {"from": ["jane"]})
+
+
+class AggregateTests(unittest.TestCase):
+    """aggregate on a throwaway index of fictional messages."""
+
+    DAY = 86400
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.path = os.path.join(self.directory.name, "index.sqlite")
+        index = mail_index.open_index(self.path)
+        now = int(time.time())
+        self.stamp = lambda year, month, day: int(datetime(year, month, day, 12).timestamp())
+        # id, account, subject, sender, timestamp, bulk, [(account, mailbox, read, flagged)]
+        rows = [
+            (1, "Work", "Invoice one", "Jane Doe <Jane@Example.com>", self.stamp(2025, 1, 10), 0,
+             [("Work", "INBOX", 0, 0)]),
+            (2, "Work", "Invoice two", "Jane D. <jane@example.com>", self.stamp(2025, 1, 20), 0,
+             [("Work", "INBOX", 1, 0), ("Work", "[Gmail]/All Mail", 1, 0)]),
+            (3, "Work", "Invoice three", "jane@example.com", self.stamp(2025, 2, 5), 0,
+             [("Work", "INBOX", 1, 1)]),
+            (4, "Work", "Sale", "Shop <news@shop.example.net>", self.stamp(2025, 2, 6), 1,
+             [("Work", "INBOX", 0, 0)]),
+            (5, "Home", "Dinner", "John Roe <john@example.org>", self.stamp(2024, 12, 24), 0,
+             [("Home", "INBOX", 1, 0)]),
+            (6, "Home", "Dinner again", "Jane Doe <jane@example.com>", self.stamp(2026, 3, 1), 0,
+             [("Home", "Archive", 0, 0)]),
+            (7, "Home", "Undated", "john@example.org", None, 0, [("Home", "INBOX", 1, 0)]),
+        ]
+        for identifier, acct, subject, sender, moment, bulk, places in rows:
+            index.execute(
+                "INSERT INTO messages (id, account, subject, sender, date_received, is_bulk, indexed_at)"
+                " VALUES (?,?,?,?,?,?,?)",
+                (identifier, acct, subject, sender, moment, bulk, now),
+            )
+            index.execute(
+                'INSERT INTO messages_fts (rowid, subject, sender, "to", cc, attachments, body,'
+                " subject_stem, attachments_stem, body_stem) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (identifier, subject, sender, "", "", "", "text", mail_stem.stem_text(subject), "", ""),
+            )
+            for place in places:
+                index.execute(
+                    "INSERT INTO locations (message, account, mailbox, read, flagged) VALUES (?,?,?,?,?)",
+                    (identifier, *place),
+                )
+        for identifier, kind, address in ((1, "to", "me@example.com"), (1, "cc", "kim@example.net"),
+                                          (2, "to", "me@example.com")):
+            index.execute(
+                "INSERT INTO recipients (message, kind, address, domain) VALUES (?,?,?,?)",
+                (identifier, kind, address, address.split("@")[1]),
+            )
+        index.commit()
+        index.close()
+        for name, value in {"INDEX_PATH": self.path, "_OWN_ADDRESSES": ["me@example.com"]}.items():
+            patcher = mock.patch.object(mail_search, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def run_aggregate(self, group_by, query="", **kwargs):
+        return mail_search.aggregate(group_by, query, max_age_minutes=10**9, **kwargs)
+
+    def counts(self, group_by, query="", **kwargs):
+        result = self.run_aggregate(group_by, query, **kwargs)
+        return {row["key"]: row["count"] for row in result["results"]}
+
+    def test_sender_folds_case_and_names_and_keeps_the_common_name(self):
+        result = self.run_aggregate("sender")
+        first = result["results"][0]
+        self.assertEqual((first["key"], first["count"]), ("jane@example.com", 4))
+        self.assertEqual(first["name"], "Jane Doe")
+        self.assertEqual(first["unread"], 2)
+        self.assertEqual(result["total"], 7)
+        self.assertEqual(result["groups"], 3)
+
+    def test_domain(self):
+        self.assertEqual(self.counts("domain"),
+                         {"example.com": 4, "example.org": 2, "shop.example.net": 1})
+
+    def test_month_and_year_are_chronological_and_limit_keeps_the_newest(self):
+        months = [row["key"] for row in self.run_aggregate("month")["results"]]
+        self.assertEqual(months, ["unknown", "2024-12", "2025-01", "2025-02", "2026-03"])
+        self.assertEqual(self.counts("month")["2025-01"], 2)
+        self.assertEqual([row["key"] for row in self.run_aggregate("month", limit=2)["results"]],
+                         ["2025-02", "2026-03"])
+        self.assertEqual(self.counts("year"), {"2024": 1, "2025": 4, "2026": 1, "unknown": 1})
+
+    def test_account_and_mailbox(self):
+        self.assertEqual(self.counts("account"), {"Work": 4, "Home": 3})
+        boxes = self.run_aggregate("mailbox")
+        by_key = {(row["account"], row["key"]): row for row in boxes["results"]}
+        self.assertEqual(by_key[("Work", "INBOX")]["count"], 4)
+        self.assertEqual(by_key[("Work", "[Gmail]/All Mail")]["count"], 1)
+        self.assertEqual(by_key[("Work", "INBOX")]["unread"], 2)
+        self.assertEqual(boxes["total"], 7)
+
+    def test_mailbox_filter_restricts_the_groups_to_that_mailbox(self):
+        result = self.run_aggregate("mailbox", mailbox="INBOX")
+        self.assertEqual({row["key"] for row in result["results"]}, {"INBOX"})
+
+    def test_message_in_several_mailboxes_counts_once(self):
+        self.assertEqual(self.counts("sender", "from:jane@example.com", account="Work")["jane@example.com"], 3)
+        self.assertEqual(self.run_aggregate("account")["total"], 7)
+
+    def test_recipients(self):
+        self.assertEqual(self.counts("recipient"), {"me@example.com": 2, "kim@example.net": 1})
+        self.assertEqual(self.counts("recipient_domain"), {"example.com": 2, "example.net": 1})
+
+    def test_recipient_unread_counts_a_message_once_per_key(self):
+        index = mail_index.open_index(self.path)
+        for address in ("me@example.com", "sam@example.com"):
+            index.execute(
+                "INSERT INTO recipients (message, kind, address, domain) VALUES (1, 'cc', ?, 'example.com')",
+                (address,),
+            )
+        index.commit()
+        index.close()
+        rows = {row["key"]: row for row in self.run_aggregate("recipient")["results"]}
+        self.assertEqual((rows["me@example.com"]["count"], rows["me@example.com"]["unread"]), (2, 1))
+        rows = {row["key"]: row for row in self.run_aggregate("recipient_domain")["results"]}
+        self.assertEqual((rows["example.com"]["count"], rows["example.com"]["unread"]), (2, 1))
+
+    def test_query_operators_and_filters(self):
+        self.assertEqual(self.counts("sender", "-is:bulk", account="Work"), {"jane@example.com": 3})
+        self.assertEqual(self.counts("domain", "invoice"), {"example.com": 3})
+        self.assertEqual(self.counts("sender", "to:me"), {"jane@example.com": 2})
+        self.assertEqual(self.counts("month", since="2025-02-01", until="2025-02-28"), {"2025-02": 2})
+        self.assertEqual(self.counts("sender", unread_only=True),
+                         {"jane@example.com": 2, "news@shop.example.net": 1})
+        self.assertEqual(self.counts("sender", flagged_only=True), {"jane@example.com": 1})
+        result = self.run_aggregate("sender", "invoice from:jane")
+        self.assertEqual(result["filters"], {"from": ["jane"]})
+
+    def test_order_by_last_date_and_limit(self):
+        keys = [row["key"] for row in self.run_aggregate("sender", order="last_date")["results"]]
+        self.assertEqual(keys[0], "jane@example.com")
+        self.assertEqual(len(self.run_aggregate("sender", limit=1)["results"]), 1)
+
+    def test_empty_result(self):
+        result = self.run_aggregate("sender", "nomatchatall")
+        self.assertEqual((result["results"], result["total"], result["groups"]), ([], 0, 0))
+
+    def test_invalid_arguments(self):
+        with self.assertRaises(MailError) as caught:
+            self.run_aggregate("colour")
+        self.assertEqual(caught.exception.code, "invalid_group_by")
+        with self.assertRaises(MailError):
+            self.run_aggregate("sender", order="newest")
 
 
 class SearchEvaluationTests(unittest.TestCase):
