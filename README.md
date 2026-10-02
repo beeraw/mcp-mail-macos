@@ -27,7 +27,7 @@ accounts, on a mailbox of roughly 50,000 messages spanning several years.
 - [macOS permissions](#macos-permissions)
 - [Add to Claude Code](#add-to-claude-code)
 - [Configuration](#configuration)
-- [The 27 tools](#the-27-tools)
+- [The 29 tools](#the-29-tools)
 - [Drafts are files, not Mail drafts](#drafts-are-files-not-mail-drafts)
 - [The search index](#the-search-index)
   - [Search by meaning](#search-by-meaning)
@@ -280,7 +280,7 @@ in `launchd/com.mcp-mail-macos.sync.plist` before installing it.
 
 ---
 
-## The 27 tools
+## The 29 tools
 
 ### Search across everything
 
@@ -409,6 +409,7 @@ having.
 | `write_draft(to, subject, body, cc, bcc, attachments, sender, folder)` | Write a draft as an `.eml` file, outside Mail |
 | `list_drafts(folder)` | Drafts waiting to be sent |
 | `read_draft_file(path)` | Full content of one draft |
+| `edit_draft_file(path, …)` | Change the draft in place — see [Edit a draft](#edit-a-draft) |
 | `send_draft_file(path, confirm, keep_file)` | Send the draft, then file it away |
 | `discard_draft_file(path)` | Delete a draft that will not be sent |
 | `purge_drafts(folder)` | Sweep forgotten drafts |
@@ -422,6 +423,7 @@ outside Mail.
 | --- | --- |
 | `send_email(to, subject, body, cc, bcc, attachments, sender, confirm)` | Compose and send |
 | `create_draft(to, subject, body, cc, bcc, attachments, sender, signature)` | Save a draft **in Mail** |
+| `edit_draft(message_id, …)` | Change a draft Mail already holds — see [Edit a draft](#edit-a-draft) |
 | `send_draft(message_id, confirm)` | Send a draft Mail already holds |
 | `reply_to_message(message_id, body, reply_all, attachments, send, confirm, add_to, add_cc, bcc)` | Reply, staying in the thread, with attachments if any; `add_to`, `add_cc` and `bcc` add recipients to the computed ones without duplicates |
 
@@ -452,6 +454,36 @@ signature off.
 The signature is not configured here. It is read from Mail's own settings for
 the sending account: which signature is selected, its HTML, and the images it
 carries. Editing it in Mail is enough; there is no second copy to keep in step.
+
+### Edit a draft
+
+`edit_draft` (a draft in Mail) and `edit_draft_file` (an `.eml` draft) take the
+same changes, any of them in one call:
+
+| Argument | Change |
+| --- | --- |
+| `subject` | New subject line |
+| `to`, `cc`, `bcc` | The whole new list for that field; an empty string clears Cc or Bcc |
+| `add_to`, `add_cc`, `add_bcc` | Addresses added to that field |
+| `remove` | Addresses taken off, whichever field holds them |
+| `body` | New text; the signature and a quoted original below it stay |
+| `replacements` | Targeted edits, `[{"old": "...", "new": "..."}]`, each found exactly once |
+| `add_attachments` | Absolute paths of files to attach |
+| `remove_attachments` | File names of attachments to take off |
+
+The draft is edited where it stands, never composed again: only the headers
+asked about and the text are rewritten, and the formatting, the signature and
+its logo, the quoted original, the attachments and the thread headers stay
+byte for byte. An address placed in a field leaves the other two, so adding to
+To someone who was in Cc moves them. Every change is checked before anything is
+written; a refused one leaves the draft untouched.
+
+A server cannot change a message in place, so `edit_draft` files the edited
+version first and only then expunges the previous one: a failure in between
+leaves two drafts, never none. The draft therefore gets a new `message_id`,
+which `list_messages(mailbox="drafts")` gives once Mail has checked the account.
+Close the draft if it is open in a Mail window, or Mail may save its own copy
+over the edit.
 
 ### Organise
 
@@ -942,6 +974,9 @@ the code and the hint.
 | `not_a_draft` | `send_draft` aimed at a message that is not in a Drafts mailbox |
 | `attachments_unreachable`, `attachments_incomplete` | Attachments could not be recovered; nothing was sent |
 | `draft_file_not_found`, `draft_file_unreadable`, `folder_not_found` | `.eml` draft or its folder missing |
+| `text_not_found`, `ambiguous_replacement` | An edit's `old` text is absent, or appears more than once |
+| `not_a_recipient`, `no_recipient`, `invalid_address` | An edit removes someone absent, would leave no recipient, or names something that is not an address |
+| `attachment_not_in_draft`, `nothing_to_change` | An edit removes a file the draft does not carry, or changes nothing |
 | `index_missing`, `not_indexed`, `sync_failed`, `sync_timeout` | Index absent, incomplete, or not refreshable |
 
 ---
@@ -1085,13 +1120,14 @@ be deleted by hand, since Mail cannot do it through AppleScript.
 
 ```
 mcp-mail-macos/
-├── server.py           # MCP entry point, the 27 tool definitions
+├── server.py           # MCP entry point, the 29 tool definitions
 ├── mail_tools.py       # driving Mail through AppleScript
 ├── mail_message.py     # building the message: body, signature, attachments
 ├── mail_signature.py   # the signature Mail would have used, from its settings
 ├── mail_draft.py       # drafting and sending, on top of the two above
 ├── mail_imap.py        # the account's own server, for filing and sending
 ├── mail_files.py       # .eml drafts, retention, leftover sweep
+├── mail_edit.py        # editing an existing draft in place, in Mail or as .eml
 ├── mail_search.py      # querying the index
 ├── mail_saved.py       # named searches (saved_search tool)
 ├── mail_index.py       # building and updating the index

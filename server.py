@@ -16,6 +16,7 @@ try:
 except ImportError:  # pragma: no cover - SDK 1.x
     from mcp.server.fastmcp import FastMCP as _Server
 
+import mail_edit
 import mail_files
 import mail_saved
 import mail_search
@@ -643,6 +644,122 @@ def send_draft(message_id: str, confirm: bool = False) -> dict[str, Any]:
             content comes back as a preview and nothing is sent.
     """
     return _guard(mail_tools.send_draft, message_id=message_id, confirm=confirm)
+
+
+
+@mcp.tool()
+def edit_draft(
+    message_id: str,
+    subject: str | None = None,
+    to: str | Sequence[str] | None = None,
+    cc: str | Sequence[str] | None = None,
+    bcc: str | Sequence[str] | None = None,
+    add_to: str | Sequence[str] | None = None,
+    add_cc: str | Sequence[str] | None = None,
+    add_bcc: str | Sequence[str] | None = None,
+    remove: str | Sequence[str] | None = None,
+    body: str | None = None,
+    replacements: list[dict[str, str]] | None = None,
+    add_attachments: Sequence[str] | None = None,
+    remove_attachments: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    """Change a draft that sits in Mail, without composing it again.
+
+    Use this rather than creating a new draft to correct one. Only what is
+    asked changes; formatting, signature, quoted original, attachments and
+    thread stay as they were. The server cannot change a message in place, so
+    the edited version is filed and the previous one then removed: the draft
+    gets a new message_id, found again with list_messages(mailbox="drafts").
+    If the draft is open in a Mail window, close it first, or Mail may save
+    its own copy over the edit.
+
+    Args:
+        message_id: identifier of the draft, as returned by
+            list_messages(mailbox="drafts").
+        subject: new subject line.
+        to, cc, bcc: the whole new list for that field — one address, a
+            comma-separated string, or a list. An empty string clears Cc or
+            Bcc. Leave out a field to keep it as it is.
+        add_to, add_cc, add_bcc: addresses to add to that field. An address
+            placed in a field leaves the other two: adding someone in To who
+            was in Cc moves them.
+        remove: addresses to take off, whichever field holds them.
+        body: the new text, plain or HTML. Only the user's own text is
+            replaced: the signature and a quoted original below it stay.
+        replacements: targeted edits, each {"old": "...", "new": "..."}. The
+            old text must appear exactly once in the draft; quote a longer
+            passage otherwise. Prefer this for small corrections: everything
+            around the passage, formatting included, stays untouched.
+        add_attachments: absolute paths of files to attach.
+        remove_attachments: file names of attachments to take off.
+
+    Every change is checked before anything is written: a refused one leaves
+    the draft as it was. The answer lists what changed and shows the draft as
+    it now reads (subject, recipients, attachments, text).
+    """
+    return _guard(
+        mail_edit.edit_draft,
+        message_id,
+        subject=subject, to=to, cc=cc, bcc=bcc,
+        add_to=add_to, add_cc=add_cc, add_bcc=add_bcc, remove=remove,
+        body=body, replacements=replacements,
+        add_attachments=add_attachments, remove_attachments=remove_attachments,
+    )
+
+
+@mcp.tool()
+def edit_draft_file(
+    path: str,
+    subject: str | None = None,
+    to: str | Sequence[str] | None = None,
+    cc: str | Sequence[str] | None = None,
+    bcc: str | Sequence[str] | None = None,
+    add_to: str | Sequence[str] | None = None,
+    add_cc: str | Sequence[str] | None = None,
+    add_bcc: str | Sequence[str] | None = None,
+    remove: str | Sequence[str] | None = None,
+    body: str | None = None,
+    replacements: list[dict[str, str]] | None = None,
+    add_attachments: Sequence[str] | None = None,
+    remove_attachments: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    """Change an .eml draft in place, without writing it again.
+
+    Only what is asked changes; formatting, signature and attachments stay as
+    they were. The file keeps its path.
+
+    Args:
+        path: path of the draft file, as returned by write_draft or list_drafts.
+        subject: new subject line.
+        to, cc, bcc: the whole new list for that field — one address, a
+            comma-separated string, or a list. An empty string clears Cc or
+            Bcc. Leave out a field to keep it as it is.
+        add_to, add_cc, add_bcc: addresses to add to that field. An address
+            placed in a field leaves the other two: adding someone in To who
+            was in Cc moves them.
+        remove: addresses to take off, whichever field holds them.
+        body: the new text, plain or HTML. Only the user's own text is
+            replaced: the signature and a quoted original below it stay.
+        replacements: targeted edits, each {"old": "...", "new": "..."}. The
+            old text must appear exactly once in the draft; quote a longer
+            passage otherwise. Prefer this for small corrections: everything
+            around the passage, formatting included, stays untouched.
+        add_attachments: absolute paths of files to attach.
+        remove_attachments: file names of attachments to take off.
+
+    Every change is checked before anything is written: a refused one leaves
+    the draft as it was. The answer lists what changed and shows the draft as
+    it now reads (subject, recipients, attachments, text).
+    """
+    return _guard(
+        mail_edit.edit_draft_file,
+        path,
+        subject=subject, to=to, cc=cc, bcc=bcc,
+        add_to=add_to, add_cc=add_cc, add_bcc=add_bcc, remove=remove,
+        body=body, replacements=replacements,
+        add_attachments=add_attachments, remove_attachments=remove_attachments,
+    )
+
 
 
 @mcp.tool()
